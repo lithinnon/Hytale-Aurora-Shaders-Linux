@@ -1,5 +1,10 @@
-
-<a href="https://buymeacoffee.com/kristijan1001" target="_blank"> <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" width="160" alt="Buy Me a Coffee"> </a>
+> [!IMPORTANT]
+> ## ☕ Please support the original creator:
+> This shader pack is [**Kristijan1001**](https://github.com/Kristijan1001)'s work —
+> this repository only adds the Linux port. If Aurora Shaders makes your game look good,
+> consider tipping the person who made it.
+>
+> <a href="https://buymeacoffee.com/kristijan1001"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" width="220" alt="Buy Me a Coffee for Kristijan1001"></a>
 
 
 https://github.com/user-attachments/assets/9c0842a6-0442-40e9-8760-67f695989e0c
@@ -293,3 +298,6 @@ This repository is the Linux fork of
 (Windows). The shader pack and licence are unchanged; the fork adds the hook and installer
 for the native Linux client — and that Linux port is **purely vibe-coded** (written by AI,
 steered and tested by a human).
+
+Please support the original creator:
+[☕ Buy Kristijan1001 a coffee](https://buymeacoffee.com/kristijan1001).
