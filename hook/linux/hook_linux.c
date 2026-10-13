@@ -1942,7 +1942,9 @@ static void menu_render(int screenH)
             int cy = py < rad ? rad - py : (py >= H - rad ? py - (H - rad - 1) : 0);
             float a = 236.0f;
             if (cx && cy) {
-                float d = sqrtf((float)(cx * cx + cy * cy));
+                // double sqrt() keeps the glibc symbol floor at 2.2.5 (sqrtf was re-versioned
+                // in newer glibc, which would make this shim refuse to load on older runtimes).
+                float d = (float)sqrt((double)(cx * cx + cy * cy));
                 a = d >= rad ? 0.0f : (d > rad - 1 ? a * (rad - d) : a);
             }
             g_ovBits[((size_t)py * W + px) * 4 + 3] = (unsigned char)a;
