@@ -18,30 +18,94 @@ https://github.com/user-attachments/assets/9c0842a6-0442-40e9-8760-67f695989e0c
 <img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/e63f95ea-0f36-4845-ae8d-54bf9d7eab6c" />
 
 
-# Aurora Shaders for Hytale
+# Aurora Shaders for Hytale (Linux)
+
+> ## ⚠️ This Linux port is purely vibe-coded
+>
+> Everything that makes this pack run on Linux — the shader hook, the installer, the tools,
+> this documentation — was **written by AI** in one sitting, prompted and tested by a human.
+> It works, but expect rough edges. The shader pack itself is human work.
+> See [Credits](#credits-and-license).
 
 A shader pack for Hytale: soft sun shadows, volumetric clouds, light shafts through trees and
 caves, reflective water, ray-traced bounce light and ambient occlusion, rain puddles, rainbows,
 a rotating star sky, lens flare and a filmic tonemap - with an in-game options menu.
 
+> **This is the Linux fork** of
+> [Aurora Shaders by Kristijan1001](https://github.com/Kristijan1001/Hytale-Aurora-Shaders):
+> the same shaders and the same in-game options, ported to the native Linux client.
+> **Windows users: install from the
+> [original repository](https://github.com/Kristijan1001/Hytale-Aurora-Shaders).**
+
 > **Not tested online, use at your own discretion.**
 
 ## Install
 
-1. Download the latest release zip from the [Releases](../../releases) page and extract it
-   somewhere permanent (the game loads the pack from this folder, so don't delete it).
-2. Close Hytale and double-click **`Install.bat`**.
-3. Start Hytale.
+> **Windows users:** this fork is Linux-only — install Aurora Shaders from the
+> [original repository](https://github.com/Kristijan1001/Hytale-Aurora-Shaders) instead;
+> its README covers the Windows installation.
 
-The installer finds the game on its own (it asks for the folder if Hytale is installed
-somewhere unusual), reads the game's shaders from your own `HytaleClient.exe`, and puts a small
-`opengl32.dll` next to the game. Nothing in the game itself is modified.
+On Linux the pack works with the native Linux client — including the official launcher
+installed as a Flatpak (`com.hypixel.HytaleLauncher`). No Wine or Proton involved.
 
-- **After a Hytale update**, run `Install.bat` again: updates replace the game folder.
-- **To remove it**, double-click `Uninstall.bat`: the game is back to vanilla.
+### Before you start
 
-Requires Windows 10 or 11 and a GPU that runs Hytale. The pack is heavier than vanilla,
-especially the RTX preset; see [Performance](#performance).
+1. **Install Hytale and launch it once** so the game files exist on your machine.
+2. **Close Hytale completely** before installing or uninstalling (check for running game
+   processes).
+3. **Keep the Aurora folder somewhere permanent** — the game loads the shaders from this
+   folder every time it runs. Moving or deleting it breaks the pack.
+4. **Install the build tools** — a C compiler and Python 3. The hook is plain C with no
+   external libraries, so any mainstream distro works out of the box:
+
+   | Distro | Command |
+   |---|---|
+   | Debian / Ubuntu / Mint | `sudo apt install build-essential python3` |
+   | Fedora | `sudo dnf install gcc python3` |
+   | Arch / Manjaro | `sudo pacman -S base-devel python` |
+   | openSUSE | `sudo zypper install gcc python3` |
+   | Nix / NixOS | `nix develop` (or `nix-shell`) in the repo root — toolchain included |
+
+   Any glibc-based distro is fine (the game itself needs glibc — musl/Alpine is not
+   supported).
+
+5. Any GPU that runs Hytale is enough — the pack is heavier than vanilla, especially the RTX
+   preset; see [Performance](#performance).
+
+### Step by step
+
+1. Get the source (the zip works too — then just extract it and `cd` into it):
+
+   ```sh
+   git clone https://github.com/lithinnon/Hytale-Aurora-Shaders-Linux.git
+   cd Hytale-Aurora-Shaders-Linux
+   ```
+
+2. Close Hytale.
+3. Install:
+
+   ```sh
+   ./install-linux.sh
+   ```
+
+4. Start Hytale from the launcher — press **Home** for the options menu, **Pause** toggles
+   the shaders on and off.
+
+- **Hytale installed somewhere else?** `./install-linux.sh --client "<...>/Client"` (the
+  folder containing `HytaleClient`). The choice is remembered for next time.
+- **After a Hytale update:** run `./install-linux.sh` again.
+- **To remove it:** `./install-linux.sh --uninstall`.
+
+What the installer does: finds the game, extracts its shaders, builds the hook, puts it
+where the Flatpak sandbox can see it, links `Client/shaderpack` to this folder, and sets
+`LD_PRELOAD` for the launcher (the hook stays inert outside the game). Nothing in the game
+is modified. More detail: [docs/LINUX.md](docs/LINUX.md).
+
+### Check that it worked
+
+- The world looks different right away: softer shadows, a new sky and clouds, coloured light.
+- **Home** opens the **AURORA SHADERS** options menu; changes apply instantly.
+- Still looks like vanilla Hytale? See [Troubleshooting](#troubleshooting).
 
 ## In game
 
@@ -169,35 +233,45 @@ runs much lighter than RTX.
 
 ## Build it yourself
 
-The release includes a prebuilt `opengl32.dll`. If you would rather not run a DLL you did not
-build, double-click **`Build From Source.bat`** instead of `Install.bat`: it compiles the DLL
-from the C source in `hook/` and installs that. The compiler (Zig) is downloaded once from
-ziglang.org and checked against the checksum ziglang.org publishes; no Visual Studio needed.
+`./install-linux.sh` builds the hook automatically when needed. To build it by hand:
 
-From PowerShell: `.\build.ps1` builds `build\opengl32.dll`, `.\install.ps1 -Build` builds and
-installs.
+```sh
+./hook/linux/build.sh        # -> build/libaurora-hook.so (any standard C compiler)
+./install-linux.sh --build   # build from source and install
+```
+
+A prebuilt `bin/libaurora-hook.so` is picked up automatically when present in a release.
+
+Nix users: `nix develop` (flake) or `nix-shell` drops you into a shell with the toolchain
+already on `PATH` — no packages to install:
+
+```sh
+nix develop -c ./hook/linux/build.sh
+```
 
 ## How it works
 
-Hytale compiles its OpenGL shaders from source embedded in `HytaleClient.exe` and has no shader
-loader. `opengl32.dll` in the game folder is loaded instead of the Windows one; it forwards every
-call to the real `opengl32.dll`, and when the game compiles a shader it recognises (by
-`shaderpack/index.txt`) and the pack has a replacement for in `shaderpack/programs/`, it compiles
-that instead. Edited shader files are recompiled live. The in-game menu is drawn by the same DLL.
+Hytale compiles its OpenGL shaders from source embedded in the game binary and has no shader
+loader. The game resolves every OpenGL call at runtime, so a small shim
+(`hook/linux/hook_linux.c`, loaded with `LD_PRELOAD`) watches shader compilation: when the
+game compiles a shader the pack recognises (by `shaderpack/index.txt`) and the pack has a
+replacement for in `shaderpack/programs/`, it compiles that instead. Edited shader files are
+recompiled live, and the in-game menu is drawn by the same shim. (The Windows original does
+the same through an `opengl32.dll` proxy — see the
+[original repository](https://github.com/Kristijan1001/Hytale-Aurora-Shaders).)
 
-Hytale's own shader sources are not redistributed: `tools/prepare_shaders.ps1` extracts them from
-the installed game into `shaderpack/original/` during install, because the pack's shaders include
-parts of them.
+Hytale's own shader sources are not redistributed: `tools/prepare_shaders.py` extracts them
+from the installed game into `shaderpack/original/` during install, because the pack's shaders
+include parts of them.
 
 ## Troubleshooting
 
-- **Looks like vanilla:** press Pause once (the shaders may be toggled off), and check that
-  `opengl32.dll` sits next to `HytaleClient.exe`. After a game update, run `Install.bat` again.
-- **Something renders wrong after a game update:** a shader that fails to compile falls back to
-  the game's own; the compiler log is in `shaderpack/errors/`, and `shaderpack/hook.log` records
-  what the DLL did. Please open an issue with those files.
-- **Antivirus warning:** some antivirus tools flag DLLs that load next to a game. Use
-  `Build From Source.bat` to build the DLL from the source yourself.
+- **Looks like vanilla:** press **Pause** once (the shaders may be toggled off), and check
+  `shaderpack/hook.log` — it should say `override applied: ...`. If the file is missing or
+  empty, run `./install-linux.sh` again (also after every game update).
+- **Something renders wrong after a game update:** a shader that fails to compile falls back
+  to the game's own; the compiler log is in `shaderpack/errors/`, and `shaderpack/hook.log`
+  records what the hook did. Please open an issue with those files.
 
 ## Known Issue
 
@@ -210,3 +284,9 @@ Aurora Shaders is a modified pack based on Complementary Shaders by Complementar
 included unchanged in [LICENSE.txt](LICENSE.txt).
 
 Shaders have been assisted by AI/Claude.
+
+This repository is the Linux fork of
+[Aurora Shaders by Kristijan1001](https://github.com/Kristijan1001/Hytale-Aurora-Shaders)
+(Windows). The shader pack and licence are unchanged; the fork adds the hook and installer
+for the native Linux client — and that Linux port is **purely vibe-coded** (written by AI,
+steered and tested by a human).

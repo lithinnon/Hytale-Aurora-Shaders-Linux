@@ -22,3 +22,6 @@ reference/
 tools/focus_game.ps1
 tools/game_input.ps1
 tools/grab_game.ps1
+
+# Python bytecode
+__pycache__/
