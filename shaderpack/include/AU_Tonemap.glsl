@@ -61,6 +61,25 @@ void DoTonemap(inout vec3 color)
     color = clamp(colorOut, vec3(0.0), vec3(1.0));
 }
 
+// Inverse of DoTonemap's curve (per channel; the dark lift and white path barely touch the
+// values it is used for): the scene colour that comes out of the tonemap as `displayLinear`.
+// Emissive texels use it to show their own colour, like Hytale's full-bright glow.
+vec3 AU_InverseTonemap(vec3 displayLinear)
+{
+    vec3 a = vec3(AU_TM_CONTRAST);
+    vec3 hdrMax = vec3(8.0);
+    vec3 midIn = vec3(0.25);
+    vec3 midOut = vec3(0.25);
+    vec3 hdrMaxA = pow(hdrMax, a);
+    vec3 midInA = pow(midIn, a);
+    vec3 HM1 = hdrMaxA * midOut;
+    vec3 HM2 = hdrMaxA - midInA;
+    vec3 b = (-midInA + HM1) / (HM2 * midOut);
+    vec3 c = (hdrMaxA * midInA - HM1 * midInA) / (HM2 * midOut);
+    vec3 y = min(displayLinear, 0.98 / b);
+    return pow(y * c / max(1.0 - y * b, vec3(1e-4)), 1.0 / a) / AU_TM_EXPOSURE;
+}
+
 void DoBSLColorSaturation(inout vec3 color)
 {
     float saturationFactor = AU_SATURATION + 0.07;

@@ -121,7 +121,9 @@ void AU_InitCommon()
     // which also hides the moment Hytale swaps the shadows between sun and moon.
     vec3 shadowLight = -vec3(SunShadowMatrix[0][0][2], SunShadowMatrix[0][1][2], SunShadowMatrix[0][2][2]);
     lightVec = dot(shadowLight, shadowLight) > 0.01 ? normalize(shadowLight) : (sunVisibility > 0.5 ? sunVec : -sunVec);
-    shadowTime *= smoothstep(-0.04, 0.10, lightVec.y);
+    // Narrow: the low sun at dawn throws window patterns across rooms like Hytale's, and a wide
+    // fade had it at a sixth of its light there.
+    shadowTime *= smoothstep(-0.06, 0.02, lightVec.y);
 
     // The colour palette follows the real sun height, so the sun touching the horizon gets
     // the full sunset colours while the light (sunVisibility) stays up a while longer.

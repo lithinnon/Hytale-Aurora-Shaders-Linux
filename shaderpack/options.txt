@@ -12,8 +12,17 @@ AU_CAVE_LIGHTING | Cave lighting % | range 0.0 500.0 25.0 | 250.0
 @ Lighting
 AU_SSAO_STRENGTH | Ambient occlusion | range 0.0 3.0 0.05 | 1.25
 AU_BLOCKLIGHT_STRENGTH | Torch light | range 0.0 3.0 0.1 | 1.0
-AU_BLOCKLIGHT_HYTALE_HUE | Torch colour (warm to Hytale) | range 0.0 1.0 0.05 | 0.65
+AU_BLOCKLIGHT_HYTALE_HUE | Torch colour (warm to Hytale) | range 0.0 1.0 0.05 | 1.0
 AU_EMISSION_STRENGTH | Emissive glow | range 0.0 6.0 0.25 | 3.0
+AU_EMISSIVE_BLOOM | Emissive bloom | range 0.0 20.0 0.5 | 4.0
+AU_ORE_BLOOM | Ore glow halo | range 0.0 20.0 0.5 | 10.0
+AU_ORE_LIGHT | Ore light on surroundings | range 0.0 12.0 0.5 | 8.0
+AU_ORE_GLOW | Glowing ores | bool | 1
+AU_ORE_GLOW_STRENGTH | Ore glow strength | range 0.0 4.0 0.1 | 2.0
+AU_ORE_SHINE | Ore shine sweep | range 0.0 3.0 0.1 | 1.0
+AU_MATERIALS | Block materials (metal, polish, wet) | bool | 1
+AU_MATERIAL_GLOSS | Material gloss | range 0.0 2.0 0.1 | 1.0
+AU_RAIN_WETNESS | Rain wetness | range 0.0 2.0 0.1 | 1.0
 AU_GENERATED_NORMALS | Block relief | bool | 1
 AU_GENERATED_NORMAL_MULT | Relief strength | range 25.0 400.0 25.0 | 100.0
 AU_SUBSURFACE | Foliage translucency | bool | 1
@@ -23,18 +32,31 @@ AU_LIGHT_HIGHLIGHT | Sun highlights | bool | 1
 AU_SHADOW_SOFTNESS | Shadow softness | range 0.0 3.0 0.1 | 1.0
 AU_CONTACT_SHADOWS | Contact shadows | bool | 1
 AU_FAR_SHADOWS | Distant shadows | bool | 1
+AU_CLOTH_TRANSMIT | Sun through curtains / cloth | range 0.0 2.0 0.1 | 0.5
 
 @ RTX
+AU_PATH_TRACING | Path tracing (experimental) | bool | 0
+AU_PT_RAYS | Rays per pixel | range 1 8 1 | 3
+AU_PT_REACH | Ray reach | range 8.0 48.0 4.0 | 24.0
+AU_PT_SKY_LIGHT | Traced sky light | range 0.0 1.0 0.05 | 0.8
+AU_PT_HISTORY | Denoiser frames | range 4.0 64.0 4.0 | 24.0
+AU_PT_LIGHTS | Traced glow light (experimental) | bool | 0
+AU_PT_LIGHT_STRENGTH | Torch light strength | range 0.0 4.0 0.25 | 1.5
+AU_PT_LIGHT_RANGE | Torch light reach | range 6.0 32.0 1.0 | 14.0
 AU_RTX_GI_STRENGTH | Bounce light | range 0.0 3.0 0.1 | 1.0
-AU_RTX_GI_RAYS | Bounce rays | range 4 32 4 | 8
-AU_RTX_GI_RADIUS | Bounce reach | range 2.0 16.0 0.5 | 8.0
+AU_PT_GI_STRENGTH | Bounce light (path tracing) | range 0.0 4.0 0.1 | 1.5
+AU_PT_AMBIENT_BOUNCE | Multi-bounce sky light | range 0.0 2.0 0.1 | 1.0
 AU_RTX_GI_AO | Ray-traced AO | range 0.0 1.0 0.05 | 0.55
+AU_RTX_GI_RAYS | Screen-space rays (no PT) | range 4 32 4 | 8
+AU_RTX_GI_RADIUS | Screen-space reach (no PT) | range 2.0 16.0 0.5 | 8.0
+AU_VOXEL_DEBUG | Voxel view | enum 0:Off 1:Voxels 2:Blend | 0
 
 @ Sky
 AU_STARS | Stars | enum 0:Off 1:Procedural 2:Hytale | 2
-AU_STARS_BRIGHTNESS | Star brightness | range 0.0 3.0 0.1 | 1.0
+AU_MOON_GLOW | Moon glow | range 0.0 2.0 0.1 | 1.0
+AU_STARS_BRIGHTNESS | Star brightness | range 0.0 3.0 0.1 | 2.0
 AU_STARS_SCALE | Star density | range 0.5 2.0 0.1 | 1.0
-AU_NIGHT_SKY_SATURATION | Night sky blue | range 1.0 3.0 0.1 | 1.8
+AU_NIGHT_SKY_SATURATION | Night sky blue | range 1.0 4.0 0.1 | 3.0
 AU_RAINBOWS | Rainbows | bool | 1
 AU_ATMOSPHERIC_FOG | Atmospheric fog | bool | 1
 AU_ATM_FOG_MULT | Fog density | range 0.0 2.0 0.05 | 0.95
@@ -49,12 +71,17 @@ AU_CLOUD_SHADOWS | Cloud shadows | bool | 1
 @ Light shafts
 AU_LIGHTSHAFTS | Light shafts | bool | 1
 AU_LIGHTSHAFT_STRENGTH | Strength | range 0.0 3.0 0.1 | 1.0
+AU_LIGHTSHAFT_HAZE | Open-air haze | range 0.0 1.0 0.05 | 0.4
 AU_LIGHTSHAFT_SCENE_AWARE | Forest / cave beams | range 0.0 1.0 0.05 | 1.0
 AU_LIGHTSHAFT_SCENE_BOOST | Beam boost | range 0.0 3.0 0.1 | 1.0
+AU_LIGHTSHAFT_SUNSET_I | Sunrise / sunset haze | range 0.0 1.0 0.05 | 0.5
 AU_LIGHTSHAFT_NIGHT_I | Moonlight haze | range 0.0 1.0 0.05 | 0.35
 
 @ Water
 AU_WATER | Shader water | bool | 1
+AU_GLASS | Shader glass | bool | 1
+AU_GLASS_TINT | Glass tint | range 0.0 1.0 0.05 | 0.7
+AU_GLASS_ABSORB | Glass darkness | range 0.0 0.9 0.05 | 0.35
 AU_WATER_REFRACTION | Refraction | range 0.0 4.0 0.25 | 2.0
 AU_WATER_FOAM | Shore foam | range 0.0 2.0 0.1 | 0.5
 AU_WATER_CAUSTICS | Underwater caustics | bool | 1
@@ -63,7 +90,7 @@ AU_RAIN_PUDDLE_STRENGTH | Puddle strength | range 0.0 2.0 0.1 | 1.0
 
 @ Post-processing
 AU_TM_EXPOSURE | Exposure | range 0.5 2.0 0.05 | 1.00
-AU_TM_CONTRAST | Contrast | range 0.80 1.40 0.01 | 1.05
+AU_TM_CONTRAST | Contrast | range 0.80 1.40 0.01 | 1.10
 AU_SATURATION | Saturation | range 0.0 2.0 0.05 | 1.00
 AU_VIBRANCE | Vibrance | range 0.0 2.0 0.05 | 1.00
 AU_BLOOM | Bloom | bool | 1
@@ -73,4 +100,9 @@ AU_LENSFLARE_I | Lens flare strength | range 0.0 5.0 0.25 | 2.5
 AU_SUN_GLARE | Sun glare | range 0.0 2.0 0.1 | 1.0
 AU_VIGNETTE | Vignette | bool | 1
 AU_TAA | Temporal anti-aliasing | bool | 1
+AU_DLSS | NVIDIA DLSS (RTX) | bool | 0
+AU_DLSS_RR | DLSS Ray Reconstruction | bool | 0
+AU_DLSS_PRESET | DLSS model | enum 0:Default 1:Sharpest 2:Less_ghosting | 0
+!DLSS_INFO | DLSS render size now | info
+AU_RENDER_SCALE | Render scale (from next start) | enum 0:Hytale_slider 100:100%_DLAA 67:67%_Quality 58:58%_Balanced 50:50%_Performance 33:33%_Ultra_Perf | 0
 AU_SHARPENING | Sharpening | range 0 10 1 | 2

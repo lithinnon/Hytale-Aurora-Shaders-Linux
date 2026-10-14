@@ -5,6 +5,8 @@ dist/
 tools/zig/
 install.config
 shaderpack/hook.log
+shaderpack/shot.bmp
+shaderpack/_shot
 shaderpack/errors/
 shaderpack/dump/
 shaderpack/programs/_*
@@ -13,7 +15,17 @@ shaderpack/programs/_*
 # ours to redistribute)
 shaderpack/original/
 shaderpack/index.txt
+shaderpack/materials.txt
+shaderpack/programs/ParticleFS.glsl
 shaderpack/programs/MapChunkFS.glsl
+shaderpack/programs/MapChunkVS.glsl
+shaderpack/programs/BlockyModelVS.glsl
+shaderpack/programs/ParticleVS.glsl
+shaderpack/programs/SkyAndCloudsVS.glsl
+shaderpack/programs/BasicVS.glsl
+shaderpack/programs/BasicFogVS.glsl
+shaderpack/programs/BeamVS.glsl
+shaderpack/programs/TextVS.glsl
 
 # The unmodified original pack, kept locally for reference only
 reference/
@@ -22,6 +34,17 @@ reference/
 tools/focus_game.ps1
 tools/game_input.ps1
 tools/grab_game.ps1
-
 # Python bytecode
 __pycache__/
+
+tools/shot.ps1
+tools/restart_game.ps1
+
+# NVIDIA DLSS SDK (proprietary, not redistributable here) and Khronos Vulkan headers, fetched locally
+third_party/
+tools/dlss_test/*.exe
+tools/dlss_test/*.pdb
+tools/dlss_test/*.dll
+tools/dlss_test/*.log
+tools/dlss_test/nvngx*
+shaderpack/dlss/

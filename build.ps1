@@ -38,7 +38,14 @@ if (-not (Test-Path $stubs)) { & python -I (Join-Path $root 'tools\gen_stubs.py'
 
 Push-Location (Join-Path $root 'hook')
 try {
-    & $zig cc -target x86_64-windows-gnu -O2 -shared -o ..\build\opengl32.dll hook.c gl_stubs.c -lgdi32 -luser32
+    # DLSS (aud_dlss.c) needs the NVIDIA DLSS SDK headers and the Vulkan headers in third_party\;
+    # without them the DLL is built without DLSS.
+    $dlss = @()
+    if ((Test-Path (Join-Path $root 'third_party\DLSS\include\nvsdk_ngx_defs.h')) -and
+        (Test-Path (Join-Path $root 'third_party\vulkan\include\vulkan\vulkan.h'))) {
+        $dlss = @('-DAU_HAS_DLSS=1', '-I..\third_party\DLSS\include', '-I..\third_party\vulkan\include', 'aud_dlss.c', '-ladvapi32')
+    }
+    & $zig cc -target x86_64-windows-gnu -O2 -shared -o ..\build\opengl32.dll hook.c gl_stubs.c @dlss -lgdi32 -luser32
     if ($LASTEXITCODE -ne 0) { throw "zig cc failed ($LASTEXITCODE)" }
 } finally { Pop-Location }
 Write-Host "Built $(Join-Path $root 'build\opengl32.dll')"

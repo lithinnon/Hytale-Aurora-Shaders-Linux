@@ -145,7 +145,10 @@ vec3 GetVolumetricLight(vec3 nPlayerPos, float lViewPos1, bool sky, float dither
     // Strength per time of day (noon / sunset / night).
     if (IsCameraUnderwater < 0.5)
         vlMult *= mix(AU_LIGHTSHAFT_NIGHT_I, mix(AU_LIGHTSHAFT_SUNSET_I, AU_LIGHTSHAFT_NOON_I, auPow3(noonFactor)), sunVisibility);
-    vec3 volumetricLight = (vlBase * dirBase + vlShaft * dirShaft) * vlColor * vlMult;
+    // The open-air haze (vlBase) has its own strength: Hytale's land is darker than Minecraft's
+    // under Complementary's light, and at full strength the haze turned open views milky. Beams
+    // (vlShaft: light right after shadow - forests, caves, windows) keep theirs.
+    vec3 volumetricLight = (vlBase * dirBase * AU_LIGHTSHAFT_HAZE + vlShaft * dirShaft) * vlColor * vlMult;
     if (IsCameraUnderwater > 0.5) volumetricLight *= pow2(vec3(0.46, 0.62, 1.0) * 0.55);
     return max(volumetricLight - dither * 0.005, vec3(0.0));
 #else

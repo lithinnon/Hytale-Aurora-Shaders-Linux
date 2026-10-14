@@ -18,13 +18,24 @@
 
 // ---- Lighting ------------------------------------------------------------------------
 #define AU_ALBEDO_MULT 0.78          // Hytale textures are painted brighter than Minecraft's
-#define AU_ALBEDO_SATURATION 0.86
+#define AU_ALBEDO_SATURATION 0.92
 #define AU_SIDE_SHADOWING 1
 #define AU_DIRECTIONAL_SHADING 1
 #define AU_BLOCKLIGHT_STRENGTH 1.0
 #define AU_BLOCKLIGHT_RANGE 1.75       // Hytale glow -> Minecraft lightmap scale
-#define AU_BLOCKLIGHT_HYTALE_HUE 0.65 // 0 = warm torch light, 1 = Hytale's per-light colours
+#define AU_BLOCKLIGHT_HYTALE_HUE 1.0 // 0 = warm torch light, 1 = Hytale's per-light colours
 #define AU_EMISSION_STRENGTH 3.00
+#define AU_EMISSIVE_MAX 1.6           // brightest a glowing ore texel gets (keeps its colour; the glow is bloom)
+#define AU_EMISSIVE_BLOOM 4.0        // extra bloom for emissive blocks (flames, potions, lava)
+#define AU_ORE_GLOW 1                 // ore specks glow (1), 2 = debug: every REFLECTIVE block glows
+#define AU_ORE_GLOW_STRENGTH 2.0
+#define AU_ORE_BLOOM 10.0             // coloured glow halo around ore crystals
+#define AU_ORE_LIGHT 8.0              // light ore crystals cast on what is around them (RTX preset)
+#define AU_ORE_SHINE 1.0              // Hytale's sweeping glint over ores (near chunks)
+#define AU_MATERIALS 1                // block materials: polished stone/bricks/planks/ice gloss, metal reflections, rain soaking
+#define AU_MATERIAL_GLOSS 1.0
+#define AU_RAIN_WETNESS 1.0           // how wet and glossy rain makes everything open to the sky
+#define AU_ORE_GLOSS 1.0              // ore crystals glossy like gems (sun glints, reflections)
 #define AU_SSAO_STRENGTH 1.25
 #define AU_CAVE_LIGHTING 250.0        // minimum light underground, %
 #define AU_SUBSURFACE 1              // foliage translucency
@@ -54,14 +65,16 @@
 #define AU_CONTACT_SHADOW_STEPS 18
 #define AU_CONTACT_SHADOW_DISTANCE 480.0
 #define AU_FAR_SHADOWS 1              // screen-space shadows past the shadow map
+#define AU_CLOTH_TRANSMIT 0.5         // sun through cloth and other two-sided models (a curtain shows the window behind it)
 #define AU_FAR_SHADOW_STEPS 32
 #define AU_NEAR_IGNORE 1.2             // depth (blocks) below which geometry is the first-person hand
 
 // ---- Sky / atmosphere ----------------------------------------------------------------
 #define AU_STARS 2                    // 0 off, 1 procedural, 2 Hytale's star texture (turning with the sky)
-#define AU_STARS_BRIGHTNESS 1.0
+#define AU_STARS_BRIGHTNESS 2.0
+#define AU_MOON_GLOW 1.0              // Hytale's halo around the moon
 #define AU_STARS_SCALE 1.0             // star texture size on the sky (lower = bigger stars)
-#define AU_NIGHT_SKY_SATURATION 1.8   // night horizon colour (1 = grey-blue, higher = deep blue)
+#define AU_NIGHT_SKY_SATURATION 3.0   // night horizon colour (1 = grey-blue, higher = deep blue)
 #define AU_ATMOSPHERIC_FOG 1
 #define AU_ATM_FOG_MULT 0.95
 #define AU_ATM_FOG_DISTANCE 1.0
@@ -95,15 +108,20 @@
 #define AU_LIGHTSHAFT_SAMPLES 12
 #endif
 #define AU_LIGHTSHAFT_STRENGTH 1.0
+#define AU_LIGHTSHAFT_HAZE 0.4         // open-air haze (beams through trees / windows are separate)
 #define AU_LIGHTSHAFT_DISTANCE 192.0
 #define AU_LIGHTSHAFT_SCENE_AWARE 1.00  // stronger shafts in caves / forests (0 = off)
 #define AU_LIGHTSHAFT_NOON_I 1.0
-#define AU_LIGHTSHAFT_SUNSET_I 1.0
+#define AU_LIGHTSHAFT_SUNSET_I 0.5    // low-sun haze (the low sun's light colour is strong; 1.0 drowned the land)
 #define AU_LIGHTSHAFT_NIGHT_I 0.35     // moonlight haze (1.0 washes Hytale nights out)
 #define AU_LIGHTSHAFT_SCENE_BOOST 1.0  // extra shaft strength under canopies / in caves (0 = off)
 
 // ---- Water ---------------------------------------------------------------------------
 #define AU_WATER 1
+#define AU_GLASS 1                    // glass tints and reflects what is behind it
+#define AU_GLASS_TINT 0.7
+#define AU_GLASS_ABSORB 0.35            // how much light glass takes away from the view through it
+#define AU_GLASS_REFLECT 0.8
 #define AU_WATER_FOG_MULT 1.0
 #define AU_WATER_SSR_STEPS 48
 #define AU_WATER_REFRACTION 2.00       // refraction strength
@@ -126,9 +144,25 @@
 #define AU_RTX_SSR_STEPS 32
 #define AU_RTX_SMOOTHNESS 0.0          // dry surfaces stay matte (only rain makes them reflective)
 
+// ---- Path tracing (RTX preset) -------------------------------------------------------
+// Voxel path tracing: the hook keeps a 256x128x256 block grid of the world around the
+// player (include/AU_Voxel.glsl) and the bounce light traces rays through it.
+#define AU_PATH_TRACING 1             // experimental: heavy, and the look is close to the screen-space GI
+#define AU_PT_GI_STRENGTH 1.5         // bounce light strength with path tracing
+#define AU_VOXELS (AU_PRESET >= 2 && AU_PATH_TRACING)
+#define AU_PT_RAYS 3                  // rays per pixel per frame
+#define AU_PT_REACH 24.0              // how far (blocks) rays travel
+#define AU_PT_HISTORY 24.0            // frames the path tracer averages over (more = smoother, slower to react)
+#define AU_PT_SKY_LIGHT 0.8           // how much the traced sky visibility shapes the ambient light
+#define AU_PT_LIGHTS 0                // experimental: path-traced light from FULLBRIGHT blocks (misses torches, they are models)
+#define AU_PT_LIGHT_STRENGTH 1.50
+#define AU_PT_LIGHT_RANGE 14.0        // blocks
+#define AU_PT_AMBIENT_BOUNCE 1.0      // how much sky light bounced surfaces pass on (multiple bounces)
+#define AU_VOXEL_DEBUG 0              // 1 = show the voxel grid (ray cast from the camera), 2 = blend over the scene
+
 // ---- Post ----------------------------------------------------------------------------
 #define AU_TM_EXPOSURE 1.00
-#define AU_TM_CONTRAST 1.05
+#define AU_TM_CONTRAST 1.10
 #define AU_TM_WHITE_PATH 1.00
 #define AU_TM_DARK_DESATURATION 0.25
 #define AU_SATURATION 1.00
@@ -142,6 +176,17 @@
 #define AU_LENSFLARE_I 2.50             // lens flare strength
 #define AU_SUN_GLARE 1.0              // soft lens glare around the visible sun
 #define AU_TAA 1                      // reprojected TAA (cleans up dithered shafts / shadows / GI)
+#define AU_DLSS 0                     // NVIDIA DLSS instead of the TAA (hook/aud_dlss.c; RTX GPUs)
+#define AU_DLSS_RR 0                  // DLSS Ray Reconstruction (denoiser + upscaler in one) instead of Super Resolution
+#define AU_RENDER_SCALE 0            // hook: Hytale's Render Scale = DLSS render size, written for the next start (0 = Hytale's slider)
+#define AU_DLSS_PRESET 0              // hook: DLSS model, 0 NVIDIA's default, 1 sharpest (K / RR E), 2 less ghosting (J / RR D)
+#define AU_DLSS_JITTER 1              // hook: sub-pixel camera jitter while DLSS runs
+#define AU_DLSS_JITTER_SX 1           // hook: sign of the jitter handed to DLSS (axis conventions)
+#define AU_DLSS_JITTER_SY 1
+#define AU_DLSS_MOTION_SX 1           // hook: sign of the motion vectors handed to DLSS
+#define AU_DLSS_MOTION_SY 1
+#define AU_DLSS_DEBUG 0               // hook: 1 = show DLSS's colour input, 2 = reset every frame, 3 = depth, 4 = motion
+#define AU_DLSS_DEPTH_HW 0            // hand DLSS hardware-style (non-linear) depth instead of linear
 #define AU_TAA_BLEND 0.93             // history weight (higher = smoother, softer motion)
 #define AU_TAA_CLIP 1.25              // neighbourhood variance clip (lower = less ghosting)
 #define AU_SHARPENING 2               // image sharpening (0-10)

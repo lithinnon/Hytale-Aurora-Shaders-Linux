@@ -49,7 +49,11 @@ int getCascade(vec3 positionFromCameraWS, vec3 normalWS, out vec4 positionLS)
 
 // Screen-space contact shadow: march towards the sun through the depth buffer. Catches the
 // grass, plants and small props that Hytale leaves out of its shadow map.
-float ContactShadow(vec3 pos, vec3 normalWS, vec3 toSun, float dither)
+// planeN: the surface's real orientation (from the depth buffer). Hits on that plane are the
+// surface itself: seen at an angle, the ray just in front of it projects onto pixels where the
+// same surface is nearer the camera, and it shadowed itself (the patch of sun a window across
+// the room puts on a curtain was blacked out).
+float ContactShadow(vec3 pos, vec3 normalWS, vec3 planeN, vec3 toSun, float dither)
 {
     float lView = length(pos);
     // Grows with distance so far trees still shadow themselves and the ground beyond the
@@ -71,8 +75,11 @@ float ContactShadow(vec3 pos, vec3 normalWS, vec3 toSun, float dither)
             float linR = GetLinearDepthFromDepthHW(rayZ, ProjectionMatrix);
             float diff = linR - linS;
             float thickness = 0.2 + t * 0.35 + lView * 0.004;
+            // The occluding point the depth buffer shows at this pixel (same view ray, nearer).
+            vec3 occ = p * (linS / max(linR, 0.0001));
+            bool ownPlane = abs(dot(occ - pos, planeN)) < 0.04 + lView * 0.002;
             // The first-person hand / held item is in the depth buffer: never an occluder.
-            if (linS > AU_NEAR_IGNORE && diff > 0.005 && diff < thickness) return 0.0;
+            if (linS > AU_NEAR_IGNORE && diff > 0.005 && diff < thickness && !ownPlane) return 0.0;
         }
     }
     return 1.0;
@@ -143,6 +150,7 @@ void main()
     vec4 positionLS;
     int cascade = getCascade(positionFromCameraWS, biasNormal, positionLS);
     float visibility = 1.0;
+    bool backLit = false;   // a face turned away from the sun
     if (cascade >= 0) {
 
     vec3 uvw = positionLS.xyz * 0.5 + 0.5;
@@ -197,7 +205,8 @@ void main()
 #if USE_CLEAN_BACKFACES
     // Faces turned away from the sun are dark; the lighting's N.L handles the gradient.
     float nDotL = dot(normalWS, lightDir);
-    if (useCleanShadowBackfaces && nDotL >= 0.0) visibility = 0.0;
+    backLit = useCleanShadowBackfaces && nDotL >= 0.0;
+    if (backLit) visibility = 0.0;
     // Sun at a grazing angle on a block face: the shadow map can't resolve it - each cascade
     // refit shifts the lit sliver along the wall (a sun streak through a roof gap that slid
     // around as the camera moved) - and the real light there is tiny. Fade it out, measured
@@ -226,8 +235,9 @@ void main()
         visibility = FarShadow(positionNoBias, -lightDir, dither, !hasSSAO && !hasBloom);
 #if AU_CONTACT_SHADOWS
     float contactDist = min(AU_CONTACT_SHADOW_DISTANCE, farCascade);
-    if (visibility > 0.01 && lView < contactDist) {
-        float contact = ContactShadow(positionNoBias, normalWS, -lightDir, dither);
+    vec3 planeN = fastNormalFromPosition(positionNoBias);   // screen derivatives: outside the branch
+    if (visibility > 0.01 && lView < contactDist && !backLit) {
+        float contact = ContactShadow(positionNoBias, normalWS, planeN, -lightDir, dither);
         float fade = smoothstep(contactDist * 0.8, contactDist, lView);
         visibility = min(visibility, mix(contact, 1.0, fade));
     }

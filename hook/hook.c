@@ -425,6 +425,12 @@ typedef struct {
     GLint ctexLoc[8];
     GLint fwdLoc[16];
     GLint locFrame, locTime, locWetness;
+    GLint locVoxGeo, locVoxCol;
+    GLint locJitter;
+    int usesGI;
+    int usesDlss;
+    GLint locDlssActive, locDlssRR;
+    GLint locMaterials;      // uHookMaterials (terrain): per-tile block materials
     int shareGen, shareSrc;  // cached: is this program the source of a texture share
 } ProgRec;
 
@@ -1028,27 +1034,56 @@ static PFN_glDrawElements r_glDrawElements;
 static PFN_glDrawArraysInstanced r_glDrawArraysInstanced;
 static PFN_glDrawElementsInstanced r_glDrawElementsInstanced;
 
+static GLuint g_giProg;   // program that wants the GI history bound at its draw (see gi_bind)
+static void gi_bind(void);
+static GLuint g_dlssProg; // the program writing the DLSS inputs (PostEffectFS, see dlss_draw)
+static int g_dlssPending; // inputs written this frame, DLSS runs at the present (dlss_present)
+static void dlss_draw(GLenum mode, GLint first, GLsizei count);
+static int dlss_present(void);
+static int dlss_present_rect(int x, int y, int w, int h, const char *how);
+static float g_jitterNdc[2], g_jitterPx[2], g_jitterNextPx[2];   // see jitter_next_frame
+// Hook-side settings (AU_Settings.glsl, read at every reload): DLSS jitter on/off and the signs
+// of the jitter / motion handed to DLSS (axis conventions).
+static double g_setDlssJitter = 1, g_setJitterSX = 1, g_setJitterSY = 1, g_setMotionSX = 1, g_setMotionSY = 1;
+static double g_setDlssDebug = 0;   // 1 = show DLSS's colour input, 2 = reset every frame, 3 depth, 4 motion
+static double g_setDlssMode = 1;    // AU_DLSS: 1 = Super Resolution, 2 = Ray Reconstruction
+static double g_setDlssPreset = 0;  // AU_DLSS_PRESET: 0 NVIDIA's default model, 1 sharpest, 2 less ghosting
+static int g_dlssPresentedFrame = -100;   // last frame DLSS's output reached the window
+static int g_postPresent;                 // the frame is on the window: UI follows, no jitter
+
+// Terrain program in use (materials): the atlas is bound by draw time, not at glUseProgram.
+static ProgRec *g_matProgRec;
+static void materials_draw_check(void);
+
 __declspec(dllexport) void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
     share_draw_capture();
+    if (g_matProgRec) materials_draw_check();
+    if (g_giProg && g_giProg == g_curProg) gi_bind();
+    if (g_dlssProg && g_dlssProg == g_curProg) { dlss_draw(mode, first, count); return; }
+    if (g_dlssPending && dlss_present()) return;
     r_glDrawArrays(mode, first, count);
 }
 
 __declspec(dllexport) void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
     share_draw_capture();
+    if (g_matProgRec) materials_draw_check();
+    if (g_dlssPending && dlss_present()) return;
     r_glDrawElements(mode, count, type, indices);
 }
 
 static void APIENTRY hook_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei inst)
 {
     share_draw_capture();
+    if (g_matProgRec) materials_draw_check();
     r_glDrawArraysInstanced(mode, first, count, inst);
 }
 
 static void APIENTRY hook_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei inst)
 {
     share_draw_capture();
+    if (g_matProgRec) materials_draw_check();
     r_glDrawElementsInstanced(mode, count, type, indices, inst);
 }
 
@@ -1208,6 +1243,671 @@ static void ensure_textures(void)
 }
 
 // ----------------------------------------------------------------------------------------
+// Voxel grid for the path tracer (shaderpack/include/AU_Voxel.glsl): two 3D images that
+// live for the whole session, auVoxGeo (R32UI) on image unit 6 and auVoxCol (RGBA8) on
+// unit 7. The game only uses image units 0-1 (its OIT k-buffer). Programs that declare
+// those images get the units assigned, and a memory barrier separates the passes that
+// write the grid (MapChunk) from the ones that read it.
+
+#define GL_TEXTURE_3D 0x806F
+#define GL_TEXTURE_BINDING_3D 0x806A
+#define GL_TEXTURE_MAX_LEVEL 0x813D
+#define GL_R32UI 0x8236
+#define GL_RED_INTEGER 0x8D94
+#define GL_UNSIGNED_INT 0x1405
+#define GL_READ_WRITE 0x88BA
+#define GL_PIXEL_UNPACK_BUFFER 0x88EC
+#define GL_PIXEL_UNPACK_BUFFER_BINDING 0x88EF
+#define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT 0x20
+#define VOX_X 256
+#define VOX_Y 128
+#define VOX_Z 256
+#define VOX_UNIT_GEO 6
+#define VOX_UNIT_COL 7
+#define VOX_UNIT_LIGHTS 3
+#define VOX_LIGHTS_W 2049   // per frame parity row: count, then 2 texels per light (1024 lights)
+
+typedef void (APIENTRY *PFN_glTexImage3D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+typedef void (APIENTRY *PFN_glBindImageTexture)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum);
+typedef void (APIENTRY *PFN_glMemoryBarrier)(GLuint);
+typedef void (APIENTRY *PFN_glBindBuffer)(GLenum, GLuint);
+typedef GLenum (APIENTRY *PFN_glGetError)(void);
+static PFN_glBindImageTexture r_glBindImageTexture;
+static PFN_glMemoryBarrier r_glMemoryBarrier;
+static GLuint g_voxTex[2];
+static GLuint g_voxLights;        // R32UI 2049x2: the emissive blocks found this frame (MapChunkVS)
+static int g_voxState;            // 0 not created yet, 1 ready, -1 unavailable
+static char g_voxLastUser[64];    // pname of the last program that used the grid
+
+static void vox_create(void)
+{
+    g_voxState = -1;
+    PFN_glTexImage3D img3d = (PFN_glTexImage3D)real_wglGetProcAddress("glTexImage3D");
+    PFN_glBindBuffer bindBuf = (PFN_glBindBuffer)real_wglGetProcAddress("glBindBuffer");
+    PFN_glGenTextures gen = (PFN_glGenTextures)GetProcAddress(g_real, "glGenTextures");
+    PFN_glTexParameteri par = (PFN_glTexParameteri)GetProcAddress(g_real, "glTexParameteri");
+    PFN_glGetError getErr = (PFN_glGetError)GetProcAddress(g_real, "glGetError");
+    r_glBindImageTexture = (PFN_glBindImageTexture)real_wglGetProcAddress("glBindImageTexture");
+    r_glMemoryBarrier = (PFN_glMemoryBarrier)real_wglGetProcAddress("glMemoryBarrier");
+    if (!img3d || !bindBuf || !r_glBindImageTexture || !r_glMemoryBarrier) { logf_("voxels: image load/store not available"); return; }
+    void *zero = calloc((size_t)VOX_X * VOX_Y * VOX_Z, 4);
+    if (!zero) return;
+    while (getErr() != 0) {}
+    GLint prevTex = 0, prevPbo = 0;
+    r_glGetIntegerv(GL_TEXTURE_BINDING_3D, &prevTex);
+    r_glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prevPbo);
+    if (prevPbo) bindBuf(GL_PIXEL_UNPACK_BUFFER, 0);
+    gen(2, g_voxTex);
+    for (int i = 0; i < 2; i++) {
+        r_glBindTexture(GL_TEXTURE_3D, g_voxTex[i]);
+        par(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        par(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        par(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0);
+        if (i == 0) img3d(GL_TEXTURE_3D, 0, GL_R32UI, VOX_X, VOX_Y, VOX_Z, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero);
+        else img3d(GL_TEXTURE_3D, 0, GL_RGBA8, VOX_X, VOX_Y, VOX_Z, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero);
+    }
+    r_glBindTexture(GL_TEXTURE_3D, (GLuint)prevTex);
+    PFN_glTexImage2D img2d = (PFN_glTexImage2D)GetProcAddress(g_real, "glTexImage2D");
+    GLint prev2d = 0;
+    r_glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev2d);
+    gen(1, &g_voxLights);
+    r_glBindTexture(GL_TEXTURE_2D, g_voxLights);
+    par(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    par(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    par(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    img2d(GL_TEXTURE_2D, 0, GL_R32UI, VOX_LIGHTS_W, 2, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero);
+    r_glBindTexture(GL_TEXTURE_2D, (GLuint)prev2d);
+    if (prevPbo) bindBuf(GL_PIXEL_UNPACK_BUFFER, (GLuint)prevPbo);
+    free(zero);
+    GLenum err = getErr();
+    if (err) { logf_("voxels: creating the grid failed (GL error 0x%x)", err); return; }
+    g_voxState = 1;
+    logf_("voxels: %dx%dx%d grid on image units %d/%d", VOX_X, VOX_Y, VOX_Z, VOX_UNIT_GEO, VOX_UNIT_COL);
+}
+
+// Empties the grid; shader reloads do this, since the shaders that fill it may have changed.
+static void vox_clear(void)
+{
+    typedef void (APIENTRY *PFN_glClearTexImage)(GLuint, GLint, GLenum, GLenum, const void *);
+    static PFN_glClearTexImage clr;
+    if (g_voxState != 1) return;
+    if (!clr) clr = (PFN_glClearTexImage)real_wglGetProcAddress("glClearTexImage");
+    if (!clr) return;
+    clr(g_voxTex[0], 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
+    clr(g_voxTex[1], 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+}
+
+// Temporal accumulation for the path tracer (DeferredFS): two ping-pong sets of
+// screen-sized textures, radiance (RGBA16F: bounce rgb, sky visibility), the world position
+// each pixel was accumulated for (RGBA32F: xyz, history length) and block light (RGBA16F,
+// torches). Each frame the shader reads last frame's set as textures (units 21/22/20) and
+// writes this frame's through images (4/5/2).
+// Sized from the viewport at the draw, since the program switch comes before it.
+#define GL_RGBA16F 0x881A
+#define GL_RGBA32F 0x8814
+#define GL_FLOAT 0x1406
+#define GL_VIEWPORT 0x0BA2
+#define GL_TEXTURE_FETCH_BARRIER_BIT 0x8
+#define GI_IMG_RAD 4
+#define GI_IMG_POS 5
+#define GI_IMG_LIGHT 2
+#define GI_TEX_RAD 21
+#define GI_TEX_POS 22
+#define GI_TEX_LIGHT 20
+static int g_frame;            // counted at PostEffectFS (defined with the uniform forwarding)
+static GLuint g_giTex[2][3];   // [frame parity][0 radiance, 1 position, 2 block light]
+static int g_giW, g_giH;
+
+static void gi_bind(void)
+{
+    typedef void (APIENTRY *PFN_glClearTexImage)(GLuint, GLint, GLenum, GLenum, const void *);
+    static PFN_glClearTexImage clr;
+    if (g_voxState != 1) return;
+    GLint vp[4] = {0};
+    r_glGetIntegerv(GL_VIEWPORT, vp);
+    if (vp[2] <= 0 || vp[3] <= 0) return;
+    if (vp[2] != g_giW || vp[3] != g_giH) {
+        PFN_glGenTextures gen = (PFN_glGenTextures)GetProcAddress(g_real, "glGenTextures");
+        PFN_glDeleteTextures del = (PFN_glDeleteTextures)GetProcAddress(g_real, "glDeleteTextures");
+        PFN_glTexImage2D img = (PFN_glTexImage2D)GetProcAddress(g_real, "glTexImage2D");
+        PFN_glTexParameteri par = (PFN_glTexParameteri)GetProcAddress(g_real, "glTexParameteri");
+        if (!clr) clr = (PFN_glClearTexImage)real_wglGetProcAddress("glClearTexImage");
+        if (g_giTex[0][0]) del(6, &g_giTex[0][0]);
+        gen(6, &g_giTex[0][0]);
+        GLint prevTex = 0;
+        r_glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+        for (int f = 0; f < 2; f++)
+            for (int k = 0; k < 3; k++) {
+                r_glBindTexture(GL_TEXTURE_2D, g_giTex[f][k]);
+                par(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                par(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                par(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                img(GL_TEXTURE_2D, 0, k == 1 ? GL_RGBA32F : GL_RGBA16F, vp[2], vp[3], 0, GL_RGBA, GL_FLOAT, NULL);
+                if (clr) clr(g_giTex[f][k], 0, GL_RGBA, GL_FLOAT, NULL);
+            }
+        r_glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
+        g_giW = vp[2];
+        g_giH = vp[3];
+        logf_("path tracer history %dx%d", g_giW, g_giH);
+    }
+    int cur = g_frame & 1;
+    r_glBindImageTexture(GI_IMG_RAD, g_giTex[cur][0], 0, 0, 0, GL_READ_WRITE, GL_RGBA16F);
+    r_glBindImageTexture(GI_IMG_POS, g_giTex[cur][1], 0, 0, 0, GL_READ_WRITE, GL_RGBA32F);
+    r_glBindImageTexture(GI_IMG_LIGHT, g_giTex[cur][2], 0, 0, 0, GL_READ_WRITE, GL_RGBA16F);
+    for (int k = 0; k < 3; k++) {
+        GLuint unit = k == 0 ? GI_TEX_RAD : (k == 1 ? GI_TEX_POS : GI_TEX_LIGHT);
+        r_glActiveTexture(GL_TEXTURE0 + unit);
+        r_glBindTexture(GL_TEXTURE_2D, g_giTex[cur ^ 1][k]);
+        if (r_glBindSampler) r_glBindSampler(unit, 0);
+        g_units[unit].target = GL_TEXTURE_2D;
+        g_units[unit].tex = g_giTex[cur ^ 1][k];
+        g_units[unit].sampler = 0;
+    }
+    r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
+}
+
+// ----------------------------------------------------------------------------------------
+// Block materials. Hytale's terrain has no material data, so the hook reads its block atlas
+// (the texture array MapChunkFS samples as uTexture) once, fingerprints every 32x32 tile and
+// looks the fingerprints up in shaderpack/materials.txt (the game's own block textures,
+// fingerprinted and classified by name at install: tools/prepare_shaders.ps1). The result is a
+// small texture array, one RG8 texel per tile (class, level), bound for the terrain shader as
+// uHookMaterials.
+
+#define MAT_UNIT 18
+#define GL_TEXTURE_2D_ARRAY_ 0x8C1A
+#define GL_TEXTURE_BINDING_2D_ARRAY_ 0x8C1D
+#define GL_TEXTURE_WIDTH_ 0x1000
+#define GL_TEXTURE_HEIGHT_ 0x1001
+#define GL_TEXTURE_DEPTH_ 0x8071
+#define GL_TEXTURE_INTERNAL_FORMAT_ 0x1003
+#define GL_PIXEL_PACK_BUFFER_ 0x88EB
+#define GL_PIXEL_UNPACK_BUFFER_ 0x88EC
+#define GL_PIXEL_PACK_BUFFER_BINDING_ 0x88ED
+#define GL_PIXEL_UNPACK_BUFFER_BINDING_ 0x88EF
+#define GL_PACK_ALIGNMENT_ 0x0D05
+#define GL_UNPACK_ALIGNMENT_ 0x0CF5
+#define GL_UNPACK_ROW_LENGTH_ 0x0CF2
+#define GL_UNPACK_IMAGE_HEIGHT_ 0x806E
+#define GL_RG8_ 0x822B
+#define GL_RG_ 0x8227
+
+typedef void (APIENTRY *PFN_matGetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
+typedef void (APIENTRY *PFN_matGetTexImage)(GLenum, GLint, GLenum, GLenum, void *);
+typedef void (APIENTRY *PFN_matPixelStorei)(GLenum, GLint);
+typedef void (APIENTRY *PFN_matTexImage3D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+typedef void (APIENTRY *PFN_matBindBuffer)(GLenum, GLuint);
+typedef void (APIENTRY *PFN_matGenTextures)(GLsizei, GLuint *);
+
+static unsigned *g_matKey;              // fingerprints, sorted
+static unsigned char (*g_matVal)[2];    // class, level
+static int g_nMat = -1;                 // -1 = materials.txt not read yet
+static GLuint g_matTex, g_matAtlas;
+static int g_matTries;
+static LARGE_INTEGER g_matNextTry;
+static LARGE_INTEGER g_freq;           // (defined with the frame timer below)
+
+static void materials_load(void)
+{
+    g_nMat = 0;
+    char *txt = read_file("materials.txt", NULL);
+    if (!txt) { logf_("materials: no materials.txt, blocks stay plain"); return; }
+    int cap = 0;
+    for (const char *c = txt; *c; c++) if (*c == '\n') cap++;
+    g_matKey = (unsigned *)malloc(sizeof(unsigned) * (cap + 1));
+    g_matVal = malloc(2 * (cap + 1));
+    char *save = NULL;
+    for (char *line = strtok_s(txt, "\n", &save); line; line = strtok_s(NULL, "\n", &save)) {
+        unsigned h;
+        int cls, lvl;
+        if (line[0] == '#' || sscanf(line, "%x %d %d", &h, &cls, &lvl) != 3 || g_nMat > cap) continue;
+        g_matKey[g_nMat] = h;
+        g_matVal[g_nMat][0] = (unsigned char)cls;
+        g_matVal[g_nMat][1] = (unsigned char)lvl;
+        g_nMat++;
+    }
+    free(txt);
+    logf_("materials: %d block textures", g_nMat);
+}
+
+// Hot reload: read materials.txt again and rebuild the map at the next terrain draw.
+static void materials_reset(void)
+{
+    free(g_matKey);
+    free(g_matVal);
+    g_matKey = NULL;
+    g_matVal = NULL;
+    g_nMat = -1;
+    g_matAtlas = 0;
+    g_matTries = 0;
+}
+
+static int materials_find(unsigned h)
+{
+    int lo = 0, hi = g_nMat - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_matKey[mid] == h) return mid;
+        if (g_matKey[mid] < h) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
+static void *mat_proc(const char *name)
+{
+    void *p = (void *)real_wglGetProcAddress(name);
+    if (!p || (uintptr_t)p <= 3 || p == (void *)-1) p = (void *)GetProcAddress(g_real, name);
+    return p;
+}
+
+// Reads the atlas and (re)builds g_matTex. Leaves MAT_UNIT bound to g_matTex.
+static void materials_build(GLuint atlas)
+{
+    static PFN_matGetTexLevelParameteriv getLevel;
+    static PFN_matGetTexImage getImage;
+    static PFN_matPixelStorei pixelStore;
+    static PFN_matTexImage3D texImage3D;
+    static PFN_matBindBuffer bindBuffer;
+    static PFN_matGenTextures genTextures;
+    static PFN_glTexParameteri texParam;
+    if (!getLevel) {
+        getLevel = (PFN_matGetTexLevelParameteriv)mat_proc("glGetTexLevelParameteriv");
+        getImage = (PFN_matGetTexImage)mat_proc("glGetTexImage");
+        pixelStore = (PFN_matPixelStorei)mat_proc("glPixelStorei");
+        texImage3D = (PFN_matTexImage3D)mat_proc("glTexImage3D");
+        bindBuffer = (PFN_matBindBuffer)mat_proc("glBindBuffer");
+        genTextures = (PFN_matGenTextures)mat_proc("glGenTextures");
+        texParam = (PFN_glTexParameteri)mat_proc("glTexParameteri");
+    }
+    if (!getLevel || !getImage || !pixelStore || !texImage3D || !bindBuffer || !genTextures || !texParam) return;
+    g_matAtlas = atlas;
+    g_matTries++;
+
+    r_glActiveTexture(GL_TEXTURE0 + MAT_UNIT);
+    r_glBindTexture(GL_TEXTURE_2D_ARRAY_, atlas);
+    GLint w = 0, h = 0, d = 0, fmt = 0;
+    getLevel(GL_TEXTURE_2D_ARRAY_, 0, GL_TEXTURE_WIDTH_, &w);
+    getLevel(GL_TEXTURE_2D_ARRAY_, 0, GL_TEXTURE_HEIGHT_, &h);
+    getLevel(GL_TEXTURE_2D_ARRAY_, 0, GL_TEXTURE_DEPTH_, &d);
+    getLevel(GL_TEXTURE_2D_ARRAY_, 0, GL_TEXTURE_INTERNAL_FORMAT_, &fmt);
+    int tx = w / 32, ty = h / 32;
+    unsigned char *px = (tx > 0 && ty > 0 && d > 0) ? (unsigned char *)malloc((size_t)w * h * d * 4) : NULL;
+    unsigned char *map = px ? (unsigned char *)calloc((size_t)tx * ty * d, 2) : NULL;
+    int found = 0, flipped = 0;
+    if (map) {
+        GLint packBuf = 0, packAlign = 4;
+        r_glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING_, &packBuf);
+        r_glGetIntegerv(GL_PACK_ALIGNMENT_, &packAlign);
+        if (packBuf) bindBuffer(GL_PIXEL_PACK_BUFFER_, 0);
+        pixelStore(GL_PACK_ALIGNMENT_, 4);
+        getImage(GL_TEXTURE_2D_ARRAY_, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        pixelStore(GL_PACK_ALIGNMENT_, packAlign);
+        if (packBuf) bindBuffer(GL_PIXEL_PACK_BUFFER_, (GLuint)packBuf);
+        // Same fingerprint as BuildMaterials: FNV-1a over RGBA, top row first, transparent
+        // texels as 0. Rows are tried in both orders (top row first in memory or last).
+        for (int l = 0; l < d; l++)
+            for (int j = 0; j < ty; j++)
+                for (int i = 0; i < tx; i++) {
+                    unsigned hf = 2166136261u, hr = 2166136261u;
+                    for (int pass = 0; pass < 2; pass++)
+                        for (int y = 0; y < 32; y++) {
+                            int row = pass ? 31 - y : y;
+                            const unsigned char *p = px + (((size_t)l * h + (size_t)j * 32 + row) * w + (size_t)i * 32) * 4;
+                            for (int x = 0; x < 32; x++, p += 4) {
+                                unsigned char c[4] = {p[0], p[1], p[2], p[3]};
+                                if (!c[3]) c[0] = c[1] = c[2] = 0;
+                                for (int k = 0; k < 4; k++) {
+                                    if (pass) { hr ^= c[k]; hr *= 16777619u; } else { hf ^= c[k]; hf *= 16777619u; }
+                                }
+                            }
+                        }
+                    int m = materials_find(hf);
+                    if (m < 0 && (m = materials_find(hr)) >= 0) flipped++;
+                    if (m < 0) continue;
+                    unsigned char *o = map + (((size_t)l * ty + j) * tx + i) * 2;
+                    o[0] = g_matVal[m][0];
+                    o[1] = g_matVal[m][1];
+                    found++;
+                }
+        if (!g_matTex) genTextures(1, &g_matTex);
+        r_glBindTexture(GL_TEXTURE_2D_ARRAY_, g_matTex);
+        GLint unpackBuf = 0, unpackAlign = 4, unpackRow = 0, unpackImgH = 0;
+        r_glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING_, &unpackBuf);
+        r_glGetIntegerv(GL_UNPACK_ALIGNMENT_, &unpackAlign);
+        r_glGetIntegerv(GL_UNPACK_ROW_LENGTH_, &unpackRow);
+        r_glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT_, &unpackImgH);
+        if (unpackBuf) bindBuffer(GL_PIXEL_UNPACK_BUFFER_, 0);
+        pixelStore(GL_UNPACK_ALIGNMENT_, 1);
+        pixelStore(GL_UNPACK_ROW_LENGTH_, 0);
+        pixelStore(GL_UNPACK_IMAGE_HEIGHT_, 0);
+        texImage3D(GL_TEXTURE_2D_ARRAY_, 0, GL_RG8_, tx, ty, d, 0, GL_RG_, GL_UNSIGNED_BYTE, map);
+        pixelStore(GL_UNPACK_ALIGNMENT_, unpackAlign);
+        pixelStore(GL_UNPACK_ROW_LENGTH_, unpackRow);
+        pixelStore(GL_UNPACK_IMAGE_HEIGHT_, unpackImgH);
+        if (unpackBuf) bindBuffer(GL_PIXEL_UNPACK_BUFFER_, (GLuint)unpackBuf);
+        texParam(GL_TEXTURE_2D_ARRAY_, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        texParam(GL_TEXTURE_2D_ARRAY_, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        texParam(GL_TEXTURE_2D_ARRAY_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        texParam(GL_TEXTURE_2D_ARRAY_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    free(px);
+    free(map);
+    logf_("materials: atlas %u is %dx%dx%d (format 0x%x), %d of %d tiles recognised%s", atlas, w, h, d, fmt,
+          found, tx * ty * d, flipped ? " (rows bottom-up)" : "");
+    // Too few: the atlas may still be filling up (or the game changed); look again later.
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    g_matNextTry.QuadPart = found < 40 ? now.QuadPart + g_freq.QuadPart * 5 : 0;
+    r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
+}
+
+// First draw of a terrain program: make sure the material map matches the atlas on its
+// uTexture unit (rebuilt when the atlas changes, or retried while it was still filling up).
+static void materials_draw_check(void)
+{
+    ProgRec *p = g_matProgRec;
+    g_matProgRec = NULL;
+    if (g_nMat < 0) materials_load();
+    if (g_nMat <= 0) return;
+    GLint unit = 0;   // a sampler the game never sets reads unit 0
+    for (int k = 0; k < p->nuni; k++)
+        if (p->uni[k].fn == U_1I && p->uni[k].data && !strcmp(p->uni[k].name, "uTexture")) unit = *(GLint *)p->uni[k].data;
+    static int logged;
+    if (logged < 3 && !g_matAtlas) {
+        logged++;
+        logf_("materials: %s uTexture unit %d -> tex %u target 0x%x", p->pname, unit,
+              unit >= 0 && unit < MAX_UNITS ? g_units[unit].tex : 0, unit >= 0 && unit < MAX_UNITS ? g_units[unit].target : 0);
+    }
+    if (unit >= 0 && unit < MAX_UNITS && g_units[unit].tex && g_units[unit].target == GL_TEXTURE_2D_ARRAY_) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        GLuint atlas = g_units[unit].tex;
+        if (atlas != g_matAtlas || (g_matNextTry.QuadPart && now.QuadPart > g_matNextTry.QuadPart && g_matTries < 12))
+            materials_build(atlas);
+    }
+}
+
+// Terrain program in use: bind the material map; check the atlas at its first draw.
+static void materials_use(ProgRec *p)
+{
+    g_matProgRec = p;
+    if (!g_matTex) return;
+    r_glActiveTexture(GL_TEXTURE0 + MAT_UNIT);
+    r_glBindTexture(GL_TEXTURE_2D_ARRAY_, g_matTex);
+    if (r_glBindSampler) r_glBindSampler(MAT_UNIT, 0);
+    g_units[MAT_UNIT].target = GL_TEXTURE_2D_ARRAY_;
+    g_units[MAT_UNIT].tex = g_matTex;
+    g_units[MAT_UNIT].sampler = 0;
+    r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
+}
+
+static void vox_use(ProgRec *p)
+{
+    if (!g_voxState) vox_create();
+    if (g_voxState != 1) return;
+    r_glBindImageTexture(VOX_UNIT_GEO, g_voxTex[0], 0, 1, 0, GL_READ_WRITE, GL_R32UI);
+    r_glBindImageTexture(VOX_UNIT_COL, g_voxTex[1], 0, 1, 0, GL_READ_WRITE, GL_RGBA8);
+    r_glBindImageTexture(VOX_UNIT_LIGHTS, g_voxLights, 0, 0, 0, GL_READ_WRITE, GL_R32UI);
+    if (strcmp(g_voxLastUser, p->pname)) {
+        r_glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+        strncpy(g_voxLastUser, p->pname, sizeof(g_voxLastUser) - 1);
+    }
+}
+
+// ----------------------------------------------------------------------------------------
+// DLSS (hook/aud_dlss.c). With AU_DLSS the pack's PostEffectFS (the last pass at render
+// size) also writes the frame's colour, depth and camera motion into textures shared with a
+// Vulkan device (image units 2-4). DLSS upscales them to the window in place of Hytale's own
+// scale-to-window draw, so Hytale's Render Scale setting is the DLSS render size. The DLSS runtime (nvngx_dlss.dll) is loaded from shaderpack\dlss.
+
+#if AU_HAS_DLSS
+#include "aud_dlss.h"
+#define GL_WRITE_ONLY 0x88B9
+#define GL_R32F 0x822E
+#define GL_RG16F 0x822F
+#define GL_COLOR_BUFFER_BIT 0x4000
+#define GL_SCISSOR_TEST 0x0C11
+#define GL_READ_FRAMEBUFFER_BINDING_ 0x8CAA
+#define GL_READ_FRAMEBUFFER_ 0x8CA8
+#define GL_COLOR_ATTACHMENT0_ 0x8CE0
+#define DLSS_IMG_COLOR 2
+#define DLSS_IMG_DEPTH 3
+#define DLSS_IMG_MOTION 4
+// Ray Reconstruction guides (PostEffectFS from the G-buffer).
+#define DLSS_IMG_ALBEDO 5
+#define DLSS_IMG_SPECULAR 6
+#define DLSS_IMG_NORMALS 7
+#define GL_RGBA8_ 0x8058
+typedef void (APIENTRY *PFN_dlBlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLuint, GLenum);
+typedef void (APIENTRY *PFN_dlGenFramebuffers)(GLsizei, GLuint *);
+typedef void (APIENTRY *PFN_dlBindFramebuffer)(GLenum, GLuint);
+typedef void (APIENTRY *PFN_dlFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef GLboolean (APIENTRY *PFN_dlIsEnabled)(GLenum);
+typedef void (APIENTRY *PFN_dlEnable)(GLenum);
+static int g_dlssState;          // 0 not tried, 1 ready, -1 unavailable
+static int g_dlssW, g_dlssH, g_dlssReset;
+static int g_dlssRR;              // the configured feature is Ray Reconstruction
+static int g_dlssPreset;          // the configured model preset (NGX value, 0 = default)
+static GLuint g_dlssReadFbo;
+static struct {
+    PFN_dlBlitFramebuffer Blit;
+    PFN_dlGenFramebuffers GenFb;
+    PFN_dlBindFramebuffer BindFb;
+    PFN_dlFramebufferTexture2D FbTex;
+    PFN_dlIsEnabled IsEnabled;
+    PFN_dlEnable Enable, Disable;
+} dl;
+
+static void *dlss_getproc(const char *name)
+{
+    void *p = (void *)real_wglGetProcAddress(name);
+    if (!p || (uintptr_t)p <= 3 || p == (void *)-1) p = (void *)GetProcAddress(g_real, name);
+    return p;
+}
+
+// Sizes of the configured feature (render = PostEffectFS viewport, output = the present's
+// viewport) and the present size seen last frame.
+static int g_dlssOW, g_dlssOH, g_presentW, g_presentH;
+
+static int dlss_quality(int renderW, int outW)
+{
+    float r = (float)renderW / (float)outW;
+    if (r > 0.99f) return 5;    // DLAA
+    if (r > 0.60f) return 2;    // Quality (67%)
+    if (r > 0.54f) return 1;    // Balanced (58%)
+    if (r > 0.40f) return 0;    // Performance (50%)
+    return 3;                   // Ultra Performance (33%)
+}
+
+static int dlss_ready(void)
+{
+    if (g_dlssState == 0) {
+        g_dlssState = -1;
+        wchar_t dir[MAX_PATH];
+        pack_path(dir, "dlss");
+        if (!r_glBindImageTexture) r_glBindImageTexture = (PFN_glBindImageTexture)real_wglGetProcAddress("glBindImageTexture");
+        if (!r_glMemoryBarrier) r_glMemoryBarrier = (PFN_glMemoryBarrier)real_wglGetProcAddress("glMemoryBarrier");
+        dl.Blit = (PFN_dlBlitFramebuffer)dlss_getproc("glBlitFramebuffer");
+        dl.GenFb = (PFN_dlGenFramebuffers)dlss_getproc("glGenFramebuffers");
+        dl.BindFb = (PFN_dlBindFramebuffer)dlss_getproc("glBindFramebuffer");
+        dl.FbTex = (PFN_dlFramebufferTexture2D)dlss_getproc("glFramebufferTexture2D");
+        dl.IsEnabled = (PFN_dlIsEnabled)dlss_getproc("glIsEnabled");
+        dl.Enable = (PFN_dlEnable)dlss_getproc("glEnable");
+        dl.Disable = (PFN_dlEnable)dlss_getproc("glDisable");
+        if (r_glBindImageTexture && r_glMemoryBarrier && dl.Blit && dl.GenFb && dl.BindFb && dl.FbTex &&
+            dl.IsEnabled && dl.Enable && dl.Disable && aud_init(logf_, dlss_getproc, dir, dir))
+            g_dlssState = 1;
+        logf_("dlss: %s", g_dlssState == 1 ? "ready" : "unavailable, the game upscales as usual");
+    }
+    return g_dlssState == 1;
+}
+
+// PostEffectFS: writes the DLSS inputs at render size (image units 2-4).
+static void dlss_draw(GLenum mode, GLint first, GLsizei count)
+{
+    if (!dlss_ready()) {
+        ProgRec *pp = prog_rec(g_curProg, 0);
+        if (pp && pp->locDlssActive >= 0) r_glUniform1i(pp->locDlssActive, 0);
+        r_glDrawArrays(mode, first, count);
+        return;
+    }
+    GLint vp[4] = {0};
+    r_glGetIntegerv(GL_VIEWPORT, vp);
+    GLint drawFb = -1;
+    r_glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &drawFb);
+    // At Render Scale 100 PostEffectFS draws straight into the window: render and output size
+    // are the same (DLAA) and DLSS runs right after this draw.
+    int direct = drawFb == 0;
+    if (direct) {
+        g_presentW = vp[2];
+        g_presentH = vp[3];
+    }
+    int rr = g_setDlssMode == 2 && aud_rr_available();
+    // Model presets: sharpest = transformer K (Super Resolution) / E (Ray Reconstruction),
+    // less ghosting = J / D.
+    int pick = (int)g_setDlssPreset;
+    int preset = pick == 1 ? (rr ? 5 : 11) : pick == 2 ? (rr ? 4 : 10) : 0;
+    if (g_presentW > 0 && (vp[2] != g_dlssW || vp[3] != g_dlssH || g_presentW != g_dlssOW || g_presentH != g_dlssOH ||
+                           rr != g_dlssRR || preset != g_dlssPreset)) {
+        int q = dlss_quality(vp[2], g_presentW);
+        g_dlssRR = rr;
+        g_dlssPreset = preset;
+        if (!aud_configure(vp[2], vp[3], g_presentW, g_presentH, q, 0, rr, preset)) {
+            g_dlssState = -1;
+            r_glDrawArrays(mode, first, count);
+            return;
+        }
+        g_dlssW = vp[2];
+        g_dlssH = vp[3];
+        g_dlssOW = g_presentW;
+        g_dlssOH = g_presentH;
+        g_dlssReset = 2;
+    }
+    // Units 2-4 hold the path tracer's history between its passes: they must get the DLSS
+    // textures or nothing (writes to an empty unit are dropped), never stay as they are.
+    int active = g_dlssOW > 0 && vp[2] == g_dlssW && vp[3] == g_dlssH;
+    r_glBindImageTexture(DLSS_IMG_COLOR, active ? aud_texture(AUD_TEX_COLOR) : 0, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    r_glBindImageTexture(DLSS_IMG_DEPTH, active ? aud_texture(AUD_TEX_DEPTH) : 0, 0, 0, 0, GL_WRITE_ONLY, GL_R32F);
+    r_glBindImageTexture(DLSS_IMG_MOTION, active ? aud_texture(AUD_TEX_MOTION) : 0, 0, 0, 0, GL_WRITE_ONLY, GL_RG16F);
+    if (g_dlssRR) {
+        r_glBindImageTexture(DLSS_IMG_ALBEDO, active ? aud_texture(AUD_TEX_ALBEDO) : 0, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA8_);
+        r_glBindImageTexture(DLSS_IMG_SPECULAR, active ? aud_texture(AUD_TEX_SPECULAR) : 0, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA8_);
+        r_glBindImageTexture(DLSS_IMG_NORMALS, active ? aud_texture(AUD_TEX_NORMALS) : 0, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    }
+
+    ProgRec *pp = prog_rec(g_curProg, 0);
+    if (pp && pp->locDlssActive >= 0) r_glUniform1i(pp->locDlssActive, active);
+    if (pp && pp->locDlssRR >= 0) r_glUniform1i(pp->locDlssRR, active && g_dlssRR);
+    r_glDrawArrays(mode, first, count);
+    if (direct) {
+        g_dlssPending = 1;
+        if (active) dlss_present_rect(vp[0], vp[1], vp[2], vp[3], "PostEffectFS (straight into the window)");
+        g_dlssPending = 0;
+    } else {
+        g_dlssPending = 1;
+    }
+}
+
+// Hytale puts the finished frame on the window either with a BasicFS draw (scaling it, Render
+// Scale below 100) or a framebuffer blit; the first of those after PostEffectFS is replaced
+// by DLSS's output. Returns 1 when it did.
+static int dlss_present_rect(int x, int y, int w, int h, const char *how)
+{
+    g_dlssPending = 0;
+    g_postPresent = 1;
+    g_presentW = w;
+    g_presentH = h;
+    static char loggedHow[64];
+    if (strcmp(loggedHow, how)) {
+        snprintf(loggedHow, sizeof(loggedHow), "%s", how);
+        logf_("dlss: frame presented by %s (%dx%d)", how, w, h);
+    }
+    if (g_dlssState != 1 || g_dlssOW != w || g_dlssOH != h) return 0;
+    GLint vp[4] = {x, y, w, h};
+    r_glMemoryBarrier(0xFFFFFFFFu);
+    if (!aud_evaluate(g_jitterPx[0] * (float)g_setJitterSX, g_jitterPx[1] * (float)g_setJitterSY,
+                      (float)g_setMotionSX, (float)g_setMotionSY, g_dlssReset > 0 || g_setDlssDebug == 2)) return 0;
+    if (g_dlssReset > 0) g_dlssReset--;
+    g_dlssPresentedFrame = g_frame;
+
+    GLint readFb = 0;
+    r_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING_, &readFb);
+    if (!g_dlssReadFbo) dl.GenFb(1, &g_dlssReadFbo);
+    dl.BindFb(GL_READ_FRAMEBUFFER_, g_dlssReadFbo);
+    dl.FbTex(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D, aud_texture(g_setDlssDebug == 1 ? AUD_TEX_COLOR : g_setDlssDebug == 3 ? AUD_TEX_DEPTH : g_setDlssDebug == 4 ? AUD_TEX_MOTION : AUD_TEX_OUTPUT), 0);
+    GLboolean scissor = dl.IsEnabled(GL_SCISSOR_TEST);
+    if (scissor) dl.Disable(GL_SCISSOR_TEST);
+    dl.Blit(0, 0, g_dlssOW, g_dlssOH, vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3], GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    if (scissor) dl.Enable(GL_SCISSOR_TEST);
+    dl.BindFb(GL_READ_FRAMEBUFFER_, (GLuint)readFb);
+    return 1;
+}
+
+// Below Render Scale 100 PostEffectFS draws offscreen and Hytale then scales the frame into
+// the window with BasicFS (or TemporalAAFS draws it there): that draw is replaced.
+static int dlss_present(void)
+{
+    ProgRec *p = g_curProg ? prog_rec(g_curProg, 0) : NULL;
+    if (!p || (strcmp(p->pname, "BasicFS") && strcmp(p->pname, "TemporalAAFS"))) return 0;
+    GLint fbo = -1;
+    r_glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &fbo);
+    if (fbo != 0) return 0;
+    GLint vp[4] = {0};
+    r_glGetIntegerv(GL_VIEWPORT, vp);
+    return dlss_present_rect(vp[0], vp[1], vp[2], vp[3], p && p->pname[0] ? p->pname : "a draw");
+}
+
+static int dlss_present_blit(GLint x0, GLint y0, GLint x1, GLint y1)
+{
+    GLint fbo = -1;
+    r_glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &fbo);
+    if (fbo != 0) return 0;
+    return dlss_present_rect(x0 < x1 ? x0 : x1, y0 < y1 ? y0 : y1, abs(x1 - x0), abs(y1 - y0), "a framebuffer blit");
+}
+#else
+static void dlss_draw(GLenum mode, GLint first, GLsizei count) { r_glDrawArrays(mode, first, count); }
+static int dlss_present(void) { g_dlssPending = 0; return 0; }
+static int dlss_present_blit(GLint x0, GLint y0, GLint x1, GLint y1) { (void)x0; (void)y0; (void)x1; (void)y1; return 0; }
+#endif
+
+typedef void (APIENTRY *PFN_glBlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLuint, GLenum);
+static PFN_glBlitFramebuffer r_glBlitFramebuffer;
+static void APIENTRY hook_glBlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLuint mask, GLenum filter)
+{
+    if (g_dlssPending && (mask & 0x4000u /*GL_COLOR_BUFFER_BIT*/) && dlss_present_blit(dx0, dy0, dx1, dy1)) return;
+    r_glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);
+}
+
+// Camera jitter for DLSS: a Halton(2,3) sub-pixel offset per frame, added to gl_Position by
+// the pack's vertex shaders (uHookJitter, in NDC). g_jitterPx is what this frame's geometry
+// used (passed to DLSS); the next frame's offset is chosen when PostEffectFS starts.
+
+static float halton(int i, int base)
+{
+    float f = 1.0f, r = 0.0f;
+    for (; i > 0; i /= base) { f /= (float)base; r += f * (float)(i % base); }
+    return r;
+}
+
+static void jitter_next_frame(void)
+{
+    g_jitterPx[0] = g_jitterNextPx[0];
+    g_jitterPx[1] = g_jitterNextPx[1];
+#if AU_HAS_DLSS
+    if (g_setDlssJitter != 0 && g_dlssState == 1 && g_dlssProg && g_dlssW > 0 && g_frame - g_dlssPresentedFrame <= 2) {
+        int i = 1 + g_frame % 32;
+        g_jitterNextPx[0] = halton(i, 2) - 0.5f;
+        g_jitterNextPx[1] = halton(i, 3) - 0.5f;
+        g_jitterNdc[0] = 2.0f * g_jitterNextPx[0] / (float)g_dlssW;
+        g_jitterNdc[1] = 2.0f * g_jitterNextPx[1] / (float)g_dlssH;
+        return;
+    }
+#endif
+    g_jitterNextPx[0] = g_jitterNextPx[1] = 0.0f;
+    g_jitterNdc[0] = g_jitterNdc[1] = 0.0f;
+}
+
+// ----------------------------------------------------------------------------------------
 // Uniform forwarding (shaderpack/forward.txt):  <SourceProgram> <srcUniform> <DestProgram|*> <dstUniform>
 // The last value the game set on the source program is replayed into the destination
 // program whenever it is used (e.g. SkyFS.uSunPosition -> DeferredFS.uHookSunPos).
@@ -1265,7 +1965,9 @@ static void trace_use(GLuint prog, ProgRec *p)
             o += snprintf(fmt + o, sizeof(fmt) - o, " c%d:%d/%d/%d/%d", a, bits[0], bits[1], bits[2], bits[3]);
         }
     }
-    logf_("TRACE use %u %s fbo=%d%s", prog, p ? p->pname : "?", fbo, fmt);
+    GLint vp[4] = {0};
+    r_glGetIntegerv(0x0BA2 /*GL_VIEWPORT*/, vp);
+    logf_("TRACE use %u %s fbo=%d vp=%dx%d%s", prog, p ? p->pname : "?", fbo, vp[2], vp[3], fmt);
 }
 
 static void check_extras(GLuint prog, ProgRec *p)
@@ -1286,6 +1988,36 @@ static void check_extras(GLuint prog, ProgRec *p)
     p->locTime = r_glGetUniformLocation(prog, "uHookTime");
     p->locWetness = r_glGetUniformLocation(prog, "uHookWetness");
     if (p->locFrame >= 0 || p->locTime >= 0 || p->locWetness >= 0) p->hasExtras = 1;
+    p->locJitter = r_glGetUniformLocation(prog, "uHookJitter");
+    if (p->locJitter >= 0) p->hasExtras = 1;
+    p->locVoxGeo = r_glGetUniformLocation(prog, "auVoxGeo");
+    p->locVoxCol = r_glGetUniformLocation(prog, "auVoxCol");
+    if (p->locVoxGeo >= 0) r_glUniform1i(p->locVoxGeo, VOX_UNIT_GEO);
+    if (p->locVoxCol >= 0) r_glUniform1i(p->locVoxCol, VOX_UNIT_COL);
+    GLint locLights = r_glGetUniformLocation(prog, "auLights");
+    if (locLights >= 0) r_glUniform1i(locLights, VOX_UNIT_LIGHTS);
+    if (p->locVoxGeo >= 0 || p->locVoxCol >= 0) p->hasExtras = 1;
+    static const struct { const char *name; GLint unit; } giUni[6] = {
+        {"auGIOut", GI_IMG_RAD}, {"auGIOutPos", GI_IMG_POS}, {"auGIOutLight", GI_IMG_LIGHT},
+        {"auGIHist", GI_TEX_RAD}, {"auGIHistPos", GI_TEX_POS}, {"auGIHistLight", GI_TEX_LIGHT}};
+    p->usesGI = 0;
+    for (int i = 0; i < 6; i++) {
+        GLint loc = r_glGetUniformLocation(prog, giUni[i].name);
+        if (loc >= 0) { r_glUniform1i(loc, giUni[i].unit); p->usesGI = 1; p->hasExtras = 1; }
+    }
+    static const struct { const char *name; GLint unit; } dlssUni[6] = {
+        {"auDlssColor", 2}, {"auDlssDepth", 3}, {"auDlssMotion", 4},
+        {"auDlssAlbedo", 5}, {"auDlssSpecular", 6}, {"auDlssNormals", 7}};
+    p->usesDlss = 0;
+    p->locDlssActive = r_glGetUniformLocation(prog, "uHookDlssActive");
+    p->locDlssRR = r_glGetUniformLocation(prog, "uHookDlssRR");
+    p->locMaterials = r_glGetUniformLocation(prog, "uHookMaterials");
+    if (p->locMaterials >= 0) { r_glUniform1i(p->locMaterials, MAT_UNIT); p->hasExtras = 1; }
+    for (int i = 0; i < 6; i++) {
+        GLint loc = r_glGetUniformLocation(prog, dlssUni[i].name);
+        if (loc >= 0) { r_glUniform1i(loc, dlssUni[i].unit); p->usesDlss = 1; p->hasExtras = 1; }
+    }
+    if (!p->usesDlss && g_dlssProg == prog) g_dlssProg = 0;
 }
 
 // Minecraft-style "wetness": follows the rain signal with Optifine's default half-lives
@@ -1348,6 +2080,14 @@ static void apply_extras(ProgRec *p)
             if (!strcmp(src->uni[k].name, g_fwd[i].srcUni)) { replay_uniform_at(&src->uni[k], p->fwdLoc[i]); break; }
         }
     }
+    if (p->locVoxGeo >= 0 || p->locVoxCol >= 0) vox_use(p);
+    if (p->locMaterials >= 0) materials_use(p);
+    if (p->locJitter >= 0) {
+        if (g_postPresent) r_glUniform2f(p->locJitter, 0.0f, 0.0f);
+        else r_glUniform2f(p->locJitter, g_jitterNdc[0], g_jitterNdc[1]);
+    }
+    if (p->usesGI) g_giProg = g_curProg;
+    if (p->usesDlss) g_dlssProg = g_curProg;
     if (p->locFrame >= 0) r_glUniform1i(p->locFrame, g_frame);
     if (p->locWetness >= 0) r_glUniform1f(p->locWetness, g_wetness);
     if (p->locTime >= 0) {
@@ -1447,8 +2187,40 @@ static void profile_collect(void)
     g_profState = 0;
 }
 
+// Reads "#define NAME value" from include/AU_Settings.glsl (def when missing).
+static double settings_num(const char *txt, const char *name, double def)
+{
+    if (!txt) return def;
+    size_t n = strlen(name);
+    for (const char *c = strstr(txt, "#define "); c; c = strstr(c + 1, "#define ")) {
+        const char *q = c + 8;
+        while (*q == ' ' || *q == '\t') q++;
+        if (strncmp(q, name, n) || (q[n] != ' ' && q[n] != '\t')) continue;
+        return atof(q + n);
+    }
+    return def;
+}
+
+static void settings_load(void)
+{
+    char *txt = read_file("include\\AU_Settings.glsl", NULL);
+    g_setDlssJitter = settings_num(txt, "AU_DLSS_JITTER", 1);
+    g_setJitterSX = settings_num(txt, "AU_DLSS_JITTER_SX", 1);
+    g_setJitterSY = settings_num(txt, "AU_DLSS_JITTER_SY", 1);
+    g_setMotionSX = settings_num(txt, "AU_DLSS_MOTION_SX", 1);
+    g_setMotionSY = settings_num(txt, "AU_DLSS_MOTION_SY", 1);
+    g_setDlssDebug = settings_num(txt, "AU_DLSS_DEBUG", 0);
+    g_setDlssMode = settings_num(txt, "AU_DLSS_RR", 0) > 0.5 ? 2 : 1;
+    g_setDlssPreset = settings_num(txt, "AU_DLSS_PRESET", 0);
+    free(txt);
+}
+
+static void materials_reset(void);
+
 static void do_reload(void)
 {
+    settings_load();
+    materials_reset();
     EnterCriticalSection(&g_lock);
     g_enabled = !g_toggleOff && !pack_flag("programs\\_disabled");
     load_index();
@@ -1467,6 +2239,7 @@ static void do_reload(void)
         DeleteFileW(path);
         g_traceRemaining = 800;
     }
+    vox_clear();
     int relinked = 0, failed = 0;
     for (size_t id = 1; id < g_progCap; id++) {
         ProgRec *p = &g_progs[id];
@@ -1496,6 +2269,7 @@ static void APIENTRY hook_glUseProgram(GLuint prog)
     }
     EnterCriticalSection(&g_lock);
     g_curProg = prog;
+    g_matProgRec = NULL;
     r_glUseProgram(prog);
     ProgRec *p = prog ? prog_rec(prog, 0) : NULL;
     if (g_profState == 2) profile_use(p ? p->pname : "");
@@ -1503,7 +2277,7 @@ static void APIENTRY hook_glUseProgram(GLuint prog)
         if (!p->blkChecked && g_nKnownBlocks) apply_known_blocks(prog, p);
         if (g_nShares) apply_shares(prog, p);
         for (int i = 0; i < g_nFwd; i++) if (!strcmp(g_fwd[i].src, p->pname)) g_fwd[i].srcProg = prog;
-        if (!strcmp(p->pname, "PostEffectFS")) { g_frame++; update_wetness(); profile_frame_marker(); profile_collect(); }
+        if (!strcmp(p->pname, "PostEffectFS")) { g_frame++; update_wetness(); profile_frame_marker(); profile_collect(); jitter_next_frame(); }
         if (g_nCtex) ensure_textures();
         if (!p->extrasChecked) check_extras(prog, p);
         if (p->hasExtras) apply_extras(p);
@@ -1563,7 +2337,8 @@ static DWORD WINAPI watcher_thread(LPVOID arg)
 
 #define MENU_MAX 160
 #define MENU_SETTINGS "include\\AU_Settings.glsl"
-enum { MO_HEADER, MO_BOOL, MO_ENUM, MO_RANGE, MO_PACK };
+enum { MO_HEADER, MO_BOOL, MO_ENUM, MO_RANGE, MO_PACK, MO_INFO };
+#define MENU_SELECTABLE(m) ((m)->kind != MO_HEADER && (m)->kind != MO_INFO)
 typedef struct {
     int kind;
     char define[48];
@@ -1663,6 +2438,12 @@ static void menu_load(void)
         snprintf(m->define, sizeof(m->define), "%s", f[0]);
         to_wide(m->label, 64, f[1]);
         char *kind = f[2];
+        if (!strcmp(m->define, "!DLSS_INFO")) {   // read-only: what DLSS is doing right now
+            m->kind = MO_INFO;
+            m->present = 1;
+            g_nMo++;
+            continue;
+        }
         if (!strcmp(m->define, "!PACK")) {
             m->kind = MO_PACK;
             m->present = 1;
@@ -1724,9 +2505,9 @@ static void menu_load(void)
     }
     free(opt);
     free(set);
-    if (g_moSel < 0 || g_moSel >= g_nMo || g_mo[g_moSel].kind == MO_HEADER) {
+    if (g_moSel < 0 || g_moSel >= g_nMo || !MENU_SELECTABLE(&g_mo[g_moSel])) {
         g_moSel = -1;
-        for (int i = 0; i < g_nMo; i++) if (g_mo[i].kind != MO_HEADER) { g_moSel = i; break; }
+        for (int i = 0; i < g_nMo; i++) if (MENU_SELECTABLE(&g_mo[i])) { g_moSel = i; break; }
     }
 }
 
@@ -1738,6 +2519,21 @@ static void format_value(const MenuOpt *m, double v, char *out, size_t cap)
 
 static void display_value(const MenuOpt *m, wchar_t *out, int cap)
 {
+    if (m->kind == MO_INFO) {
+#if AU_HAS_DLSS
+        static const wchar_t *modes[] = {L"Performance", L"Balanced", L"Quality", L"Ultra Perf", L"Ultra Quality", L"DLAA"};
+        int q = g_dlssOW > 0 ? dlss_quality(g_dlssW, g_dlssOW) : -1;
+        if (g_dlssState == 1 && g_dlssOW > 0 && g_frame - g_dlssPresentedFrame <= 30)
+            _snwprintf(out, cap, L"%dx%d  %d%%  %ls", g_dlssW, g_dlssH, (int)(100.0 * g_dlssW / g_dlssOW + 0.5),
+                       q >= 0 && q <= 5 ? modes[q] : L"");
+        else
+            _snwprintf(out, cap, L"%ls", g_dlssState == -1 ? L"unavailable" : L"not running");
+#else
+        _snwprintf(out, cap, L"n/a");
+#endif
+        out[cap - 1] = 0;
+        return;
+    }
     if (!m->present) { _snwprintf(out, cap, L"n/a"); out[cap - 1] = 0; return; }
     if (m->kind == MO_BOOL || m->kind == MO_PACK) { _snwprintf(out, cap, L"%ls", m->value > 0.5 ? L"On" : L"Off"); out[cap - 1] = 0; return; }
     if (m->kind == MO_ENUM)
@@ -1757,7 +2553,7 @@ static void menu_save(void)
     int changed = 0;
     for (int i = 0; i < g_nMo; i++) {
         MenuOpt *m = &g_mo[i];
-        if (m->kind == MO_HEADER || m->kind == MO_PACK || !m->present) continue;
+        if (m->kind == MO_HEADER || m->kind == MO_PACK || m->kind == MO_INFO || !m->present) continue;
         char *e = NULL;
         char *v = find_define_value(set, m->define, &e);
         if (!v) continue;
@@ -1789,7 +2585,7 @@ static void menu_save(void)
 static void menu_move(int dir)
 {
     for (int i = g_moSel + dir; i >= 0 && i < g_nMo; i += dir)
-        if (g_mo[i].kind != MO_HEADER) { g_moSel = i; g_menuDirty = 1; return; }
+        if (MENU_SELECTABLE(&g_mo[i])) { g_moSel = i; g_menuDirty = 1; return; }
 }
 
 static void menu_section(int dir)
@@ -1803,14 +2599,14 @@ static void menu_section(int dir)
         while (i > 0 && g_mo[i].kind != MO_HEADER) i--;    // previous section's header
     }
     for (int k = i < 0 ? 0 : i; k < g_nMo; k++)
-        if (g_mo[k].kind != MO_HEADER) { g_moSel = k; g_menuDirty = 1; return; }
+        if (MENU_SELECTABLE(&g_mo[k])) { g_moSel = k; g_menuDirty = 1; return; }
 }
 
 static void menu_change(int dir, int reset)
 {
     if (g_moSel < 0) return;
     MenuOpt *m = &g_mo[g_moSel];
-    if (!m->present) return;
+    if (!m->present || m->kind == MO_INFO) return;
     double v = m->value;
     if (reset) {
         v = m->def;
@@ -2011,7 +2807,7 @@ static void menu_render(int screenH)
         if (sel && m->present) _snwprintf(shown, 64, L"\x2039   %ls   \x203A", val);
         else _snwprintf(shown, 64, L"%ls", val);
         shown[63] = 0;
-        int modified = m->present && fabs(m->value - m->def) > 1e-9;
+        int modified = m->present && m->kind != MO_INFO && fabs(m->value - m->def) > 1e-9;
         menu_text(dc, shown, W * 6 / 10, y, W - pad, y + rowH, sel ? g_fBold : g_fText,
                   modified ? RGB(255, 196, 112) : RGB(238, 242, 250), DT_RIGHT);
     }
@@ -2307,11 +3103,98 @@ static void menu_frame(HDC hdc)
     LeaveCriticalSection(&g_menuLock);
 }
 
+// Screenshot for testing: creating shaderpack/_shot makes the next frame (before the menu
+// overlay) be saved as shaderpack/shot.bmp, box-filtered down to at most 1600 pixels wide.
+// Reads the back buffer, so it works where desktop capture of the game window does not.
+#define GL_READ_FRAMEBUFFER 0x8CA8
+#define GL_READ_FRAMEBUFFER_BINDING 0x8CAA
+#define GL_PIXEL_PACK_BUFFER 0x88EB
+#define GL_PIXEL_PACK_BUFFER_BINDING 0x88ED
+#define GL_READ_BUFFER 0x0C02
+#define GL_PACK_ALIGNMENT 0x0D05
+#define GL_BACK 0x0405
+typedef void (APIENTRY *PFN_glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+typedef void (APIENTRY *PFN_glReadBuffer)(GLenum);
+typedef void (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
+
+static void shot_frame(HDC hdc)
+{
+    static int counter;
+    if (++counter % 10 || !pack_flag("_shot")) return;
+    wchar_t flag[MAX_PATH];
+    pack_path(flag, "_shot");
+    DeleteFileW(flag);
+    PFN_glReadPixels readPx = (PFN_glReadPixels)GetProcAddress(g_real, "glReadPixels");
+    PFN_glReadBuffer readBuf = (PFN_glReadBuffer)GetProcAddress(g_real, "glReadBuffer");
+    PFN_glPixelStorei pst = (PFN_glPixelStorei)GetProcAddress(g_real, "glPixelStorei");
+    PFN_glBindFramebuffer bindFb = (PFN_glBindFramebuffer)real_wglGetProcAddress("glBindFramebuffer");
+    PFN_glBindBuffer bindBuf = (PFN_glBindBuffer)real_wglGetProcAddress("glBindBuffer");
+    RECT rc;
+    if (!readPx || !readBuf || !pst || !bindFb || !bindBuf || !GetClientRect(WindowFromDC(hdc), &rc)) return;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    unsigned char *px = (unsigned char *)malloc((size_t)w * h * 4);
+    if (!px) return;
+    GLint prevFb = 0, prevPbo = 0, prevBuf = 0, prevAlign = 4;
+    r_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevFb);
+    r_glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prevPbo);
+    r_glGetIntegerv(GL_READ_BUFFER, &prevBuf);
+    r_glGetIntegerv(GL_PACK_ALIGNMENT, &prevAlign);
+    bindFb(GL_READ_FRAMEBUFFER, 0);
+    bindBuf(GL_PIXEL_PACK_BUFFER, 0);
+    readBuf(GL_BACK);
+    pst(GL_PACK_ALIGNMENT, 1);
+    readPx(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    pst(GL_PACK_ALIGNMENT, prevAlign);
+    readBuf((GLenum)prevBuf);
+    bindBuf(GL_PIXEL_PACK_BUFFER, (GLuint)prevPbo);
+    bindFb(GL_READ_FRAMEBUFFER, (GLuint)prevFb);
+
+    int f = (w + 1599) / 1600;
+    int ow = w / f, oh = h / f, stride = (ow * 3 + 3) & ~3;
+    unsigned char *out = (unsigned char *)calloc((size_t)stride * oh, 1);
+    if (out) {
+        for (int y = 0; y < oh; y++)
+            for (int x = 0; x < ow; x++) {
+                unsigned sum[3] = {0, 0, 0};
+                for (int j = 0; j < f; j++)
+                    for (int i = 0; i < f; i++) {
+                        const unsigned char *s = px + (((size_t)(y * f + j) * w) + x * f + i) * 4;
+                        sum[0] += s[2]; sum[1] += s[1]; sum[2] += s[0];
+                    }
+                unsigned char *d = out + (size_t)y * stride + x * 3;
+                for (int c = 0; c < 3; c++) d[c] = (unsigned char)(sum[c] / (unsigned)(f * f));
+            }
+        // GL rows run bottom-up like a BMP's.
+        BITMAPFILEHEADER fh = {0};
+        BITMAPINFOHEADER ih = {0};
+        fh.bfType = 0x4D42;
+        fh.bfOffBits = sizeof(fh) + sizeof(ih);
+        fh.bfSize = fh.bfOffBits + (DWORD)(stride * oh);
+        ih.biSize = sizeof(ih);
+        ih.biWidth = ow;
+        ih.biHeight = oh;
+        ih.biPlanes = 1;
+        ih.biBitCount = 24;
+        Str bmp = {0};
+        str_add(&bmp, (const char *)&fh, sizeof(fh));
+        str_add(&bmp, (const char *)&ih, sizeof(ih));
+        str_add(&bmp, (const char *)out, (size_t)stride * oh);
+        write_file("shot.bmp", bmp.p, bmp.n);
+        free(bmp.p);
+        free(out);
+        logf_("screenshot %dx%d -> shot.bmp (%dx%d)", w, h, ow, oh);
+    }
+    free(px);
+}
+
 typedef BOOL (WINAPI *PFN_wglSwapBuffers)(HDC);
 static PFN_wglSwapBuffers r_wglSwapBuffers;
 
 __declspec(dllexport) BOOL WINAPI wglSwapBuffers(HDC hdc)
 {
+    g_postPresent = 0;
+    shot_frame(hdc);
     menu_frame(hdc);
     return r_wglSwapBuffers(hdc);
 }
@@ -2329,7 +3212,7 @@ __declspec(dllexport) PROC WINAPI wglGetProcAddress(LPCSTR name)
     HOOK(glUniform3i) HOOK(glUniform4i) HOOK(glUniform3ui) HOOK(glUniform1fv) HOOK(glUniform2fv) HOOK(glUniform3fv)
     HOOK(glUniform4fv) HOOK(glUniform1iv) HOOK(glUniform1uiv) HOOK(glUniformMatrix2fv) HOOK(glUniformMatrix3fv)
     HOOK(glUniformMatrix4fv) HOOK(glActiveTexture) HOOK(glBindSampler)
-    HOOK(glDrawArraysInstanced) HOOK(glDrawElementsInstanced)
+    HOOK(glDrawArraysInstanced) HOOK(glDrawElementsInstanced) HOOK(glBlitFramebuffer)
 #undef HOOK
     if (!strcmp(name, "glBindTexture")) return (PROC)glBindTexture;
     if (!strcmp(name, "glDrawArrays")) return (PROC)glDrawArrays;
@@ -2339,9 +3222,57 @@ __declspec(dllexport) PROC WINAPI wglGetProcAddress(LPCSTR name)
     return p;
 }
 
+// AU_RENDER_SCALE (menu, 0 = leave it to Hytale's slider): Hytale's own Render Scale, which
+// is the DLSS render size. Hytale keeps it in memory and writes UserData\Settings.json when it
+// quits, so the menu's choice is written after that, at process exit, for the next start.
+static void render_scale_on_exit(void)
+{
+    char *set = read_file("include\\AU_Settings.glsl", NULL);
+    int scale = (int)settings_num(set, "AU_RENDER_SCALE", 0);
+    free(set);
+    if (scale < 10 || scale > 100) return;
+    // ...\Hytale\install\release\package\game\latest\Client\HytaleClient.exe -> ...\Hytale
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, path, MAX_PATH)) return;
+    for (int i = 0; i < 7; i++) {
+        wchar_t *slash = wcsrchr(path, L'\\');
+        if (!slash) return;
+        *slash = 0;
+    }
+    wcscat(path, L"\\UserData\\Settings.json");
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *txt = n > 0 ? (char *)malloc((size_t)n + 1) : NULL;
+    size_t got = txt ? fread(txt, 1, (size_t)n, f) : 0;
+    fclose(f);
+    if (!txt || got != (size_t)n) { free(txt); return; }
+    txt[n] = 0;
+    char *k = strstr(txt, "\"RenderScale\":");
+    if (k) {
+        char *v = k + 14;
+        while (*v == ' ') v++;
+        char *e = v;
+        while (*e >= '0' && *e <= '9') e++;
+        if (e > v && atoi(v) != scale && (f = _wfopen(path, L"wb")) != NULL) {
+            fwrite(txt, 1, (size_t)(v - txt), f);
+            fprintf(f, "%d", scale);
+            fwrite(e, 1, strlen(e), f);
+            fclose(f);
+        }
+    }
+    free(txt);
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
+    if (reason == DLL_PROCESS_DETACH) {
+        render_scale_on_exit();
+        return TRUE;
+    }
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(inst);
         InitializeCriticalSection(&g_lock);
@@ -2374,6 +3305,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         g_enabled = !pack_flag("programs\\_disabled");
         QueryPerformanceFrequency(&g_freq);
         QueryPerformanceCounter(&g_t0);
+        settings_load();
         load_index();
         load_shares();
         load_textures_cfg();

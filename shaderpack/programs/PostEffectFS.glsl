@@ -1,4 +1,5 @@
 #version 410 core
+#extension GL_ARB_shader_image_load_store : enable
 
 #define PIXELSIZE uPixelSize
 #include "Fallback_inc.glsl"
@@ -16,12 +17,45 @@
 uniform vec2 uPixelSize;
 #include "DepthOfField_inc.glsl"
 #include "AU_Tonemap.glsl"
-#if AU_DEBUG || AU_LENSFLARE
+#if AU_DEBUG || AU_LENSFLARE || AU_DLSS
 #include "SceneData_inc.glsl"
 #include "AU_Common.glsl"
 #endif
-#if AU_LENSFLARE
+#if AU_LENSFLARE || AU_DLSS
 uniform sampler2D uHookDepth;   // DeferredFS linear depth (0..1 of the far plane), shared by the hook
+#endif
+#if AU_DLSS
+#include "Reconstruction_inc.glsl"
+// DLSS inputs: textures shared with the hook's Vulkan device (hook/aud_dlss.c). The hook
+// upscales them with DLSS in place of Hytale's final scale-to-window draw.
+layout(rgba16f) uniform writeonly image2D auDlssColor;
+layout(r32f) uniform writeonly image2D auDlssDepth;
+layout(rg16f) uniform writeonly image2D auDlssMotion;
+uniform int uHookDlssActive;    // 1 only while the hook has the DLSS textures bound to units 2-4
+#if AU_DLSS && AU_DLSS_RR
+// DLSS Ray Reconstruction also reads what each pixel's surface is made of (guide images,
+// units 5-7), worked out here from Hytale's G-buffer (shared by the hook).
+#include "Deferred_inc.glsl"
+uniform sampler2D uHookGBuffer0;   // albedo + render flags
+uniform sampler2D uHookGBuffer1;   // world-space normal (encoded)
+layout(rgba8) uniform writeonly image2D auDlssAlbedo;
+layout(rgba8) uniform writeonly image2D auDlssSpecular;
+layout(rgba16f) uniform writeonly image2D auDlssNormals;
+uniform int uHookDlssRR;           // 1 while the hook runs Ray Reconstruction (guides bound)
+
+// Average specular reflectance for a view angle (Karis' fit of the split-sum GGX lookup).
+vec3 AU_EnvBRDF(vec3 f0, float roughness, float NdotV)
+{
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    vec2 ab = vec2(-1.04, 1.04) * a004 + r.zw;
+    return f0 * ab.x + ab.y;
+}
+#endif
+#endif
+#if AU_LENSFLARE
 
 // Lens flare (sun and moon).
 float auAspect;
@@ -68,9 +102,10 @@ void DoLensFlare(inout vec3 color, vec2 texCoord, float dither, sampler2D sceneT
     auTexCoord = texCoord;
     auAspect = ViewportSize.x / ViewportSize.y;
     auFovMult = ProjectionMatrix[1][1] / 1.37373871;
-    vec3 sunVecVS = normalize(mat3(ViewMatrix) * sunVec);
+    // The sun by day, the moon by night (never the moon in daylight when the sun is behind).
+    vec3 sunVecVS = normalize(mat3(ViewMatrix) * (sunVisibility > 0.5 ? sunVec : -sunVec));
     vec4 clipPosSun = ProjectionMatrix * vec4(sunVecVS + 0.001, 1.0);
-    if (clipPosSun.w <= 0.0) clipPosSun = ProjectionMatrix * vec4(-sunVecVS + 0.001, 1.0);   // moon side
+    if (clipPosSun.w <= 0.0) return;   // behind the camera
     vec3 lightPos3 = clipPosSun.xyz / clipPosSun.w * 0.5;
     vec2 lightPos = lightPos3.xy;
     vec2 screenPosSun = lightPos3.xy + 0.5;
@@ -448,5 +483,59 @@ void main()
     ivec2 tileSize = ivec2(vec2(textureSize(uColorTexture, 0)) / uDebugTileResolution.xy);
     vec2 v = floor(mod(gl_FragCoord.xy, tileSize.xy));
     if(v.x == 0 || v.y == 0) outColor =  vec4(1);
+#endif
+
+#if AU_DLSS
+    if (uHookDlssActive == 1) {
+        // The finished frame, its depth and the camera motion (where each pixel's surface was
+        // last frame, in pixels; the first-person hand moves with the camera).
+        float lin = min(texture(uHookDepth, fragTexCoords).r, 1.0);
+        vec3 posVS = PositionFromLinearDepth(fragTexCoords, -lin * FarClip, ProjInfos);
+        vec4 prevClip = ReprojectionMatrix * vec4(posVS, 1.0);
+        vec2 prevUV = prevClip.xy / prevClip.w * 0.5 + 0.5;
+        // Against the same point projected with this frame's matrix (not the pixel position):
+        // the depth reconstruction doesn't match Hytale's projection exactly, and the
+        // difference showed up as motion in a still image that DLSS smeared its history with.
+        vec4 curClip = ProjectionMatrix * vec4(posVS, 1.0);
+        vec2 curUV = curClip.xy / curClip.w * 0.5 + 0.5;
+        vec2 motion = lin * FarClip < AU_NEAR_IGNORE ? vec2(0.0) : (prevUV - curUV) / uPixelSize;
+        ivec2 pix = ivec2(gl_FragCoord.xy);
+        imageStore(auDlssColor, pix, vec4(outColor.rgb, 1.0));
+#if AU_DLSS_DEPTH_HW
+        // Hardware-style depth (0 near .. 1 far, non-linear) from the linear depth.
+        float n = NearFarClip.x, z = max(lin * FarClip, n);
+        imageStore(auDlssDepth, pix, vec4(lin >= 1.0 ? 1.0 : (1.0 / n - 1.0 / z) / (1.0 / n - 1.0 / FarClip)));
+#else
+        imageStore(auDlssDepth, pix, vec4(lin));
+#endif
+        imageStore(auDlssMotion, pix, vec4(motion, 0.0, 0.0));
+#if AU_DLSS && AU_DLSS_RR
+        if (uHookDlssRR == 1) {
+            // Sky: the defaults NVIDIA recommends (grey albedo, no specular, no normal).
+            vec3 diffuseAlbedo = vec3(0.5), specularAlbedo = vec3(0.0);
+            vec4 normalRough = vec4(0.0);
+            if (lin < 1.0) {
+                vec4 g0 = texture(uHookGBuffer0, fragTexCoords);
+                vec3 normal = decodeNormal(texture(uHookGBuffer1, fragTexCoords).rg);
+                // Matte blocks; the glowing ore crystals are glossy (DeferredFS gives them gloss).
+                uint meta = uint(round(g0.a * 255.0));
+                uint cls = (meta >> 5) & 3u;
+                float level = float((meta >> 2) & 7u) / 7.0;
+                float crystal = cls == 0u ? level : 0.0;
+                float gloss = cls == 1u ? (level < 0.5 ? 0.0 : mix(0.12, 0.92, level)) : cls == 2u ? mix(0.35, 0.85, level) : 0.0;
+                float roughness = 1.0 - max(0.8 * smoothstep(0.0, 0.4, crystal), min(gloss * AU_MATERIAL_GLOSS, 0.95));
+                vec3 nVS = mat3(ViewMatrix) * normal;
+                float NdotV = clamp(dot(nVS, -normalize(posVS)), 0.0, 1.0);
+                diffuseAlbedo = mix(vec3(GetLuminance(g0.rgb)), g0.rgb, AU_ALBEDO_SATURATION) * AU_ALBEDO_MULT;
+                specularAlbedo = AU_EnvBRDF(cls == 2u ? diffuseAlbedo : vec3(0.04 + 0.02 * crystal), roughness, NdotV);
+                if (cls == 2u) diffuseAlbedo *= 0.55;
+                normalRough = vec4(normal, roughness);
+            }
+            imageStore(auDlssAlbedo, pix, vec4(diffuseAlbedo, 1.0));
+            imageStore(auDlssSpecular, pix, vec4(specularAlbedo, 1.0));
+            imageStore(auDlssNormals, pix, normalRough);
+        }
+#endif
+    }
 #endif
 }

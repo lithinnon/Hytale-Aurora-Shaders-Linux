@@ -19,6 +19,16 @@ try {
 } finally { Pop-Location }
 New-Item -ItemType Directory -Force (Join-Path $stage 'bin') | Out-Null
 Copy-Item (Join-Path $root 'build\opengl32.dll') (Join-Path $stage 'bin\opengl32.dll')
+# NVIDIA's DLSS runtime (not in git; redistributable under the DLSS SDK license, shipped with it).
+$dlss = Join-Path $root 'shaderpack\dlss'
+if (Test-Path (Join-Path $dlss 'nvngx_dlss.dll')) {
+    New-Item -ItemType Directory -Force (Join-Path $stage 'shaderpack\dlss') | Out-Null
+    Copy-Item (Join-Path $dlss 'nvngx_dlss*.dll') (Join-Path $stage 'shaderpack\dlss')
+    $lic = Join-Path $root 'third_party\DLSS\LICENSE.txt'
+    if (Test-Path $lic) { Copy-Item $lic (Join-Path $stage 'shaderpack\dlss\NVIDIA-DLSS-LICENSE.txt') }
+} else {
+    Write-Host 'No DLSS runtime in shaderpack\dlss: the release ships without DLSS'
+}
 
 $zip = Join-Path $dist "Aurora-Shaders-$Version.zip"
 if (Test-Path $zip) { Remove-Item $zip }
