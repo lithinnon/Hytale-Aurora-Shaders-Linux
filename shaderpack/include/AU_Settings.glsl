@@ -168,7 +168,7 @@
 #define AU_SATURATION 1.00
 #define AU_VIBRANCE 1.00
 #define AU_BLOOM 1
-#define AU_BLOOM_STRENGTH 0.12
+#define AU_BLOOM_STRENGTH 0.15
 #define AU_BLOOM_FOG 1                // glowing haze at night, in rain, caves and underwater
 #define AU_KEEP_HYTALE_GRADING 0.6   // how much of Hytale's per-biome colour filter/saturation to keep
 #define AU_VIGNETTE 1

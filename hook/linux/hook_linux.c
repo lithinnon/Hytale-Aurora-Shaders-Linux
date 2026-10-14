@@ -367,6 +367,10 @@ static char *build_override(const char *orig, int idx)
     if (!main) return NULL;
 
     Str out = {0};
+    // The game trims any UTF-8 BOM before compiling; the override prefix must too (a BOM
+    // ahead of #version breaks the GLSL parser).
+    if ((unsigned char)orig[0] == 0xEF && (unsigned char)orig[1] == 0xBB && (unsigned char)orig[2] == 0xBF)
+        orig += 3;
     const char *marker = strstr(orig, "END: CPU - DEFINES");
     if (marker) {
         const char *eol = strchr(marker, '\n');
