@@ -459,6 +459,8 @@ typedef struct {
     GLint ctexLoc[8];
     GLint fwdLoc[16];
     GLint locFrame, locTime, locWetness;
+    GLint locMaterials;      // uHookMaterials (terrain): per-tile block materials
+    int uniTexture;          // cached index of the game's uTexture uniform (-1 = not found)
     int shareGen, shareSrc;  // cached: is this program the source of a texture share
 } ProgRec;
 
@@ -1043,14 +1045,239 @@ static int is_share_src(ProgRec *p)
 
 // Shares are captured at draw time: by the next glUseProgram the game has often re-bound the
 // unit for the following pass (the shadow map's unit holds the scene depth by then).
+static void materials_draw_check(void);
 static void share_draw_capture(void)
 {
+    materials_draw_check();
     if (!g_nShares || !g_curProg) return;
     ProgRec *p = prog_rec(g_curProg, 0);
     if (!p || !p->linked || !is_share_src(p)) return;
     pthread_mutex_lock(&g_lock);
     capture_shares(p);
     pthread_mutex_unlock(&g_lock);
+}
+
+// ----------------------------------------------------------------------------------------
+// Block materials (parity with the Windows hook.c): shaderpack/materials.txt maps a
+// fingerprint of every 32x32 game block texture (FNV-1a over RGBA, transparent texels as 0;
+// tools/prepare_shaders.py BuildMaterials) to a material class + level. Once per atlas the
+// tiles are fingerprinted the same way and handed to the terrain shader as uHookMaterials
+// (one RG8 texel per tile: class, level). Without materials.txt blocks stay plain.
+
+#define MAT_UNIT 18
+#define GL_TEXTURE_2D_ARRAY_ 0x8C1A
+#define GL_TEXTURE_WIDTH_ 0x1000
+#define GL_TEXTURE_HEIGHT_ 0x1001
+#define GL_TEXTURE_DEPTH_ 0x8071
+#define GL_TEXTURE_INTERNAL_FORMAT_ 0x1003
+#define GL_PIXEL_PACK_BUFFER_ 0x88EB
+#define GL_PIXEL_UNPACK_BUFFER_ 0x88EC
+#define GL_PIXEL_PACK_BUFFER_BINDING_ 0x88ED
+#define GL_PIXEL_UNPACK_BUFFER_BINDING_ 0x88EF
+#define GL_PACK_ALIGNMENT_ 0x0D05
+#define GL_UNPACK_ALIGNMENT_ 0x0CF5
+#define GL_UNPACK_ROW_LENGTH_ 0x0CF2
+#define GL_UNPACK_IMAGE_HEIGHT_ 0x806E
+#define GL_RG8_ 0x822B
+#define GL_RG_ 0x8227
+#ifndef GL_UNSIGNED_BYTE
+#define GL_UNSIGNED_BYTE 0x1401
+#endif
+#ifndef GL_RGBA
+#define GL_RGBA 0x1908
+#endif
+
+typedef void (*PFN_matGetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
+typedef void (*PFN_matGetTexImage)(GLenum, GLint, GLenum, GLenum, void *);
+typedef void (*PFN_matPixelStorei)(GLenum, GLint);
+typedef void (*PFN_matTexImage3D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+typedef void (*PFN_matBindBuffer)(GLenum, GLuint);
+typedef void (*PFN_matGenTextures)(GLsizei, GLuint *);
+typedef void (*PFN_matTexParameteri)(GLenum, GLenum, GLint);
+static PFN_matGetTexLevelParameteriv mat_getLevel;
+static PFN_matGetTexImage mat_getImage;
+static PFN_matPixelStorei mat_pixelStore;
+static PFN_matTexImage3D mat_texImage3D;
+static PFN_matBindBuffer mat_bindBuffer;
+static PFN_matGenTextures mat_genTextures;
+static PFN_matTexParameteri mat_texParameteri;
+
+static unsigned *g_matKey;              // fingerprints, sorted
+static unsigned char (*g_matVal)[2];    // class, level
+static int g_nMat = -1;                 // -1 = materials.txt not read yet
+static GLuint g_matTex, g_matZero, g_matAtlas;
+static double g_matNextTry;
+
+static void *mat_proc(const char *name) { return real_getproc(name); }
+
+static void materials_load(void)
+{
+    g_nMat = 0;
+    char *txt = read_file("materials.txt", NULL);
+    if (!txt) { logf_("materials: no materials.txt, blocks stay plain"); return; }
+    int cap = 0;
+    for (const char *c = txt; *c; c++) if (*c == '\n') cap++;
+    g_matKey = (unsigned *)malloc(sizeof(unsigned) * (cap + 1));
+    g_matVal = (unsigned char (*)[2])malloc(2 * (cap + 1));
+    char *save = NULL;
+    for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        unsigned h;
+        int cls, lvl;
+        if (line[0] == '#' || sscanf(line, "%x %d %d", &h, &cls, &lvl) != 3 || g_nMat > cap) continue;
+        g_matKey[g_nMat] = h;
+        g_matVal[g_nMat][0] = (unsigned char)cls;
+        g_matVal[g_nMat][1] = (unsigned char)lvl;
+        g_nMat++;
+    }
+    free(txt);
+    logf_("materials: %d block textures", g_nMat);
+}
+
+// Hot reload: read materials.txt again and rebuild the map at the next terrain draw.
+static void materials_reset(void)
+{
+    free(g_matKey);
+    free(g_matVal);
+    g_matKey = NULL;
+    g_matVal = NULL;
+    g_nMat = -1;
+    g_matAtlas = 0;
+    g_matNextTry = 0;
+}
+
+static int materials_find(unsigned h)
+{
+    int lo = 0, hi = g_nMat - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_matKey[mid] == h) return mid;
+        if (g_matKey[mid] < h) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
+// A 1x1 black array so uHookMaterials never falls back to whatever sits on unit 0.
+static void materials_zero(void)
+{
+    if (g_matZero || !mat_texImage3D) return;
+    if (!mat_genTextures) mat_genTextures = (PFN_matGenTextures)mat_proc("glGenTextures");
+    if (!mat_texParameteri) mat_texParameteri = (PFN_matTexParameteri)mat_proc("glTexParameteri");
+    if (!mat_genTextures) return;
+    mat_genTextures(1, &g_matZero);
+    r_glBindTexture(GL_TEXTURE_2D_ARRAY_, g_matZero);
+    unsigned char z[2] = {0, 0};
+    mat_texImage3D(GL_TEXTURE_2D_ARRAY_, 0, GL_RG8_, 1, 1, 1, 0, GL_RG_, GL_UNSIGNED_BYTE, z);
+    mat_texParameteri(GL_TEXTURE_2D_ARRAY_, 0x2801 /*MIN_FILTER*/, GL_NEAREST);
+    mat_texParameteri(GL_TEXTURE_2D_ARRAY_, 0x2800 /*MAG_FILTER*/, GL_NEAREST);
+}
+
+// Reads the atlas and (re)builds g_matTex.
+static void materials_build(GLuint atlas)
+{
+    if (!mat_getLevel) {
+        mat_getLevel = (PFN_matGetTexLevelParameteriv)mat_proc("glGetTexLevelParameteriv");
+        mat_getImage = (PFN_matGetTexImage)mat_proc("glGetTexImage");
+        mat_pixelStore = (PFN_matPixelStorei)mat_proc("glPixelStorei");
+        mat_texImage3D = (PFN_matTexImage3D)mat_proc("glTexImage3D");
+        mat_bindBuffer = (PFN_matBindBuffer)mat_proc("glBindBuffer");
+        mat_genTextures = (PFN_matGenTextures)mat_proc("glGenTextures");
+        mat_texParameteri = (PFN_matTexParameteri)mat_proc("glTexParameteri");
+    }
+    if (!mat_getLevel || !mat_getImage || !mat_pixelStore || !mat_texImage3D || !mat_bindBuffer || !mat_genTextures || !mat_texParameteri) return;
+    g_matAtlas = atlas;
+
+    r_glActiveTexture(GL_TEXTURE0 + MAT_UNIT);
+    r_glBindTexture(GL_TEXTURE_2D_ARRAY_, atlas);
+    GLint w = 0, h = 0, d = 0, fmt = 0;
+    mat_getLevel(GL_TEXTURE_2D_ARRAY_, 0, GL_TEXTURE_WIDTH_, &w);
+    mat_getLevel(GL_TEXTURE_2D_ARRAY_, 0, GL_TEXTURE_HEIGHT_, &h);
+    mat_getLevel(GL_TEXTURE_2D_ARRAY_, 0, GL_TEXTURE_DEPTH_, &d);
+    mat_getLevel(GL_TEXTURE_2D_ARRAY_, 0, GL_TEXTURE_INTERNAL_FORMAT_, &fmt);
+    int tx = w / 32, ty = h / 32;
+    unsigned char *px = (tx > 0 && ty > 0 && d > 0) ? (unsigned char *)malloc((size_t)w * h * d * 4) : NULL;
+    unsigned char *map = px ? (unsigned char *)calloc((size_t)tx * ty * d, 2) : NULL;
+    int found = 0, flipped = 0;
+    if (map) {
+        GLint packBuf = 0, packAlign = 4;
+        r_glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING_, &packBuf);
+        r_glGetIntegerv(GL_PACK_ALIGNMENT_, &packAlign);
+        if (packBuf) mat_bindBuffer(GL_PIXEL_PACK_BUFFER_, 0);
+        mat_pixelStore(GL_PACK_ALIGNMENT_, 4);
+        mat_getImage(GL_TEXTURE_2D_ARRAY_, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        mat_pixelStore(GL_PACK_ALIGNMENT_, packAlign);
+        if (packBuf) mat_bindBuffer(GL_PIXEL_PACK_BUFFER_, (GLuint)packBuf);
+        // Same fingerprint as BuildMaterials: FNV-1a over RGBA, top row first, transparent
+        // texels as 0. Rows are tried in both orders (top row first in memory or last).
+        for (int l = 0; l < d; l++)
+            for (int j = 0; j < ty; j++)
+                for (int i = 0; i < tx; i++) {
+                    unsigned hf = 2166136261u, hr = 2166136261u;
+                    for (int pass = 0; pass < 2; pass++)
+                        for (int y = 0; y < 32; y++) {
+                            int row = pass ? 31 - y : y;
+                            const unsigned char *q = px + (((size_t)l * h + (size_t)j * 32 + row) * w + (size_t)i * 32) * 4;
+                            for (int x = 0; x < 32; x++, q += 4) {
+                                unsigned char c[4] = {q[0], q[1], q[2], q[3]};
+                                if (!c[3]) c[0] = c[1] = c[2] = 0;
+                                for (int k = 0; k < 4; k++) {
+                                    if (pass) { hr ^= c[k]; hr *= 16777619u; } else { hf ^= c[k]; hf *= 16777619u; }
+                                }
+                            }
+                        }
+                    int m = materials_find(hf);
+                    if (m < 0 && (m = materials_find(hr)) >= 0) flipped++;
+                    if (m < 0) continue;
+                    unsigned char *o = map + (((size_t)l * ty + j) * tx + i) * 2;
+                    o[0] = g_matVal[m][0];
+                    o[1] = g_matVal[m][1];
+                    found++;
+                }
+        if (!g_matTex) mat_genTextures(1, &g_matTex);
+        r_glBindTexture(GL_TEXTURE_2D_ARRAY_, g_matTex);
+        GLint unpackBuf = 0, unpackAlign = 4, unpackRow = 0, unpackImgH = 0;
+        r_glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING_, &unpackBuf);
+        r_glGetIntegerv(GL_UNPACK_ALIGNMENT_, &unpackAlign);
+        r_glGetIntegerv(GL_UNPACK_ROW_LENGTH_, &unpackRow);
+        r_glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT_, &unpackImgH);
+        if (unpackBuf) mat_bindBuffer(GL_PIXEL_UNPACK_BUFFER_, 0);
+        mat_pixelStore(GL_UNPACK_ALIGNMENT_, 1);
+        mat_pixelStore(GL_UNPACK_ROW_LENGTH_, 0);
+        mat_pixelStore(GL_UNPACK_IMAGE_HEIGHT_, 0);
+        mat_texImage3D(GL_TEXTURE_2D_ARRAY_, 0, GL_RG8_, tx, ty, d, 0, GL_RG_, GL_UNSIGNED_BYTE, map);
+        mat_pixelStore(GL_UNPACK_ALIGNMENT_, unpackAlign);
+        mat_pixelStore(GL_UNPACK_ROW_LENGTH_, unpackRow);
+        mat_pixelStore(GL_UNPACK_IMAGE_HEIGHT_, unpackImgH);
+        if (unpackBuf) mat_bindBuffer(GL_PIXEL_UNPACK_BUFFER_, (GLuint)unpackBuf);
+        mat_texParameteri(GL_TEXTURE_2D_ARRAY_, 0x2801 /*MIN_FILTER*/, GL_NEAREST);
+        mat_texParameteri(GL_TEXTURE_2D_ARRAY_, 0x2800 /*MAG_FILTER*/, GL_NEAREST);
+        mat_texParameteri(GL_TEXTURE_2D_ARRAY_, 0x2802 /*WRAP_S*/, 0x812F /*CLAMP_TO_EDGE*/);
+        mat_texParameteri(GL_TEXTURE_2D_ARRAY_, 0x2803 /*WRAP_T*/, 0x812F /*CLAMP_TO_EDGE*/);
+    }
+    free(px);
+    free(map);
+    logf_("materials: atlas %u is %dx%dx%d (format 0x%x), %d of %d tiles recognised%s", atlas, w, h, d, fmt,
+          found, tx * ty * d, flipped ? " (rows bottom-up)" : "");
+    // Too few: the atlas may still be filling up (or the game changed); look again later.
+    g_matNextTry = found < 40 ? now_s() + 5.0 : 0;
+    r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
+}
+
+// A terrain draw: make sure the material map matches the atlas on its uTexture unit
+// (rebuilt when the atlas changes, or retried while it was still filling up).
+static void materials_draw_check(void)
+{
+    if (g_nMat <= 0 || !g_curProg) return;
+    ProgRec *p = prog_rec(g_curProg, 0);
+    if (!p || !p->linked || p->locMaterials < 0 || p->uniTexture < 0) return;
+    if (now_s() < g_matNextTry) return;
+    GLint unit = -1;
+    UniformRec *u = &p->uni[p->uniTexture];
+    if (u->data) unit = *(GLint *)u->data;
+    if (unit < 0 || unit >= MAX_UNITS) return;
+    GLuint atlas = g_units[unit].tex;
+    if (!atlas || g_units[unit].target != GL_TEXTURE_2D_ARRAY_) return;
+    if (atlas == g_matAtlas && g_matTex) return;   // already built for this atlas
+    materials_build(atlas);
 }
 
 typedef void (*PFN_glDrawArrays)(GLenum, GLint, GLsizei);
@@ -1313,7 +1540,11 @@ static void check_extras(GLuint prog, ProgRec *p)
     p->locFrame = r_glGetUniformLocation(prog, "uHookFrame");
     p->locTime = r_glGetUniformLocation(prog, "uHookTime");
     p->locWetness = r_glGetUniformLocation(prog, "uHookWetness");
-    if (p->locFrame >= 0 || p->locTime >= 0 || p->locWetness >= 0) p->hasExtras = 1;
+    p->locMaterials = r_glGetUniformLocation(prog, "uHookMaterials");
+    p->uniTexture = -1;
+    for (int k = 0; k < p->nuni; k++)
+        if (p->uni[k].fn == U_1I && !strcmp(p->uni[k].name, "uTexture")) { p->uniTexture = k; break; }
+    if (p->locFrame >= 0 || p->locTime >= 0 || p->locWetness >= 0 || p->locMaterials >= 0) p->hasExtras = 1;
 }
 
 // Minecraft-style "wetness": follows the rain signal with Optifine's default half-lives
@@ -1378,6 +1609,22 @@ static void apply_extras(ProgRec *p)
     if (p->locFrame >= 0) r_glUniform1i(p->locFrame, g_frame);
     if (p->locWetness >= 0) r_glUniform1f(p->locWetness, g_wetness);
     if (p->locTime >= 0) r_glUniform1f(p->locTime, (float)(now_s() - g_t0));
+    if (p->locMaterials >= 0) {
+        if (g_nMat < 0) materials_load();
+        if (!mat_texImage3D) {
+            mat_texImage3D = (PFN_matTexImage3D)mat_proc("glTexImage3D");
+            mat_texParameteri = (PFN_matTexParameteri)mat_proc("glTexParameteri");
+        }
+        materials_zero();
+        GLuint mt = g_matTex ? g_matTex : g_matZero;
+        if (mt) {
+            r_glActiveTexture(GL_TEXTURE0 + MAT_UNIT);
+            r_glBindTexture(GL_TEXTURE_2D_ARRAY_, mt);
+            if (r_glBindSampler) r_glBindSampler(MAT_UNIT, 0);
+            r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
+        }
+        r_glUniform1i(p->locMaterials, MAT_UNIT);
+    }
 }
 
 // ----------------------------------------------------------------------------------------
@@ -1475,6 +1722,7 @@ static void do_reload(void)
     g_enabled = !g_toggleOff && !pack_flag("programs/_disabled");
     load_index();
     load_shares();
+    materials_reset();
     load_textures_cfg();
     load_forward_cfg();
     if (pack_flag("programs/_profile")) {
