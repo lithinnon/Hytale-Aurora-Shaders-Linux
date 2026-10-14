@@ -147,7 +147,7 @@
 // ---- Path tracing (RTX preset) -------------------------------------------------------
 // Voxel path tracing: the hook keeps a 256x128x256 block grid of the world around the
 // player (include/AU_Voxel.glsl) and the bounce light traces rays through it.
-#define AU_PATH_TRACING 1             // experimental: heavy, and the look is close to the screen-space GI
+#define AU_PATH_TRACING 0             // experimental: heavy, and the look is close to the screen-space GI
 #define AU_PT_GI_STRENGTH 1.5         // bounce light strength with path tracing
 #define AU_VOXELS (AU_PRESET >= 2 && AU_PATH_TRACING)
 #define AU_PT_RAYS 3                  // rays per pixel per frame
@@ -168,7 +168,7 @@
 #define AU_SATURATION 1.00
 #define AU_VIBRANCE 1.00
 #define AU_BLOOM 1
-#define AU_BLOOM_STRENGTH 0.15
+#define AU_BLOOM_STRENGTH 0.12
 #define AU_BLOOM_FOG 1                // glowing haze at night, in rain, caves and underwater
 #define AU_KEEP_HYTALE_GRADING 0.6   // how much of Hytale's per-biome colour filter/saturation to keep
 #define AU_VIGNETTE 1

@@ -1792,7 +1792,7 @@ static void hook_glUseProgram(GLuint prog)
 
 #define MENU_MAX 160
 #define MENU_SETTINGS "include/AU_Settings.glsl"
-enum { MO_HEADER, MO_BOOL, MO_ENUM, MO_RANGE, MO_PACK };
+enum { MO_HEADER, MO_BOOL, MO_ENUM, MO_RANGE, MO_PACK, MO_INFO };
 typedef struct {
     int kind;
     char define[48];
@@ -1914,6 +1914,8 @@ static void menu_load(void)
             if (m->step <= 0.0) m->step = 1.0;
             m->decimals = decimals_of(c);
             m->isFloat = strchr(a, '.') || strchr(b, '.') || strchr(c, '.');
+        } else if (!strncmp(kind, "info", 4)) {
+            m->kind = MO_INFO;   // display-only note: not selectable, never saved
         } else {
             continue;
         }
@@ -1940,9 +1942,9 @@ static void menu_load(void)
     }
     free(opt);
     free(set);
-    if (g_moSel < 0 || g_moSel >= g_nMo || g_mo[g_moSel].kind == MO_HEADER) {
+    if (g_moSel < 0 || g_moSel >= g_nMo || g_mo[g_moSel].kind == MO_HEADER || g_mo[g_moSel].kind == MO_INFO) {
         g_moSel = -1;
-        for (int i = 0; i < g_nMo; i++) if (g_mo[i].kind != MO_HEADER) { g_moSel = i; break; }
+        for (int i = 0; i < g_nMo; i++) if (g_mo[i].kind != MO_HEADER && g_mo[i].kind != MO_INFO) { g_moSel = i; break; }
     }
 }
 
@@ -1954,6 +1956,7 @@ static void format_value(const MenuOpt *m, double v, char *out, size_t cap)
 
 static void display_value(const MenuOpt *m, char *out, size_t cap)
 {
+    if (m->kind == MO_INFO) { out[0] = 0; return; }
     if (!m->present) { snprintf(out, cap, "n/a"); return; }
     if (m->kind == MO_BOOL || m->kind == MO_PACK) { snprintf(out, cap, "%s", m->value > 0.5 ? "On" : "Off"); return; }
     if (m->kind == MO_ENUM) {
@@ -1972,7 +1975,7 @@ static void menu_save(void)
     int changed = 0;
     for (int i = 0; i < g_nMo; i++) {
         MenuOpt *m = &g_mo[i];
-        if (m->kind == MO_HEADER || m->kind == MO_PACK || !m->present) continue;
+        if (m->kind == MO_HEADER || m->kind == MO_PACK || m->kind == MO_INFO || !m->present) continue;
         char *e = NULL;
         char *v = find_define_value(set, m->define, &e);
         if (!v) continue;
@@ -2004,7 +2007,7 @@ static void menu_save(void)
 static void menu_move(int dir)
 {
     for (int i = g_moSel + dir; i >= 0 && i < g_nMo; i += dir)
-        if (g_mo[i].kind != MO_HEADER) { g_moSel = i; g_menuDirty = 1; return; }
+        if (g_mo[i].kind != MO_HEADER && g_mo[i].kind != MO_INFO) { g_moSel = i; g_menuDirty = 1; return; }
 }
 
 static void menu_section(int dir)

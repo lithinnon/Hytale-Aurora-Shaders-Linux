@@ -100,9 +100,12 @@ AU_LENSFLARE_I | Lens flare strength | range 0.0 5.0 0.25 | 2.5
 AU_SUN_GLARE | Sun glare | range 0.0 2.0 0.1 | 1.0
 AU_VIGNETTE | Vignette | bool | 1
 AU_TAA | Temporal anti-aliasing | bool | 1
-AU_DLSS | NVIDIA DLSS (RTX) | bool | 0
-AU_DLSS_RR | DLSS Ray Reconstruction | bool | 0
-AU_DLSS_PRESET | DLSS model | enum 0:Default 1:Sharpest 2:Less_ghosting | 0
-!DLSS_INFO | DLSS render size now | info
-AU_RENDER_SCALE | Render scale (from next start) | enum 0:Hytale_slider 100:100%_DLAA 67:67%_Quality 58:58%_Balanced 50:50%_Performance 33:33%_Ultra_Perf | 0
+# NVIDIA DLSS / Ray Reconstruction is unavailable on native Linux: the bridge (hook/aud_dlss.c)
+# is Windows-only (Vulkan<->GL interop + NVIDIA's NGX runtime). The switches stay hidden here
+# and AU_Settings.glsl keeps them at 0; the info line below says so in the menu.
+#AU_DLSS | NVIDIA DLSS (RTX) | bool | 0
+#AU_DLSS_RR | DLSS Ray Reconstruction | bool | 0
+#AU_DLSS_PRESET | DLSS model | enum 0:Default 1:Sharpest 2:Less_ghosting | 0
+#AU_RENDER_SCALE | Render scale (from next start) | enum 0:Hytale_slider 100:100%_DLAA 67:67%_Quality 58:58%_Balanced 50:50%_Performance 33:33%_Ultra_Perf | 0
+!DLSS_INFO | NVIDIA DLSS: not available on native Linux | info
 AU_SHARPENING | Sharpening | range 0 10 1 | 2

@@ -232,6 +232,7 @@ These only apply with the **RTX** preset.
 | **Vignette** | Slightly darker screen edges. |
 | **Temporal anti-aliasing** | Smooths edges and cleans up the fine grain in shadows, light shafts and bounce light by combining frames. Turning it off makes those grainy. |
 | **Sharpening** | Sharpens the image (0 is off). |
+| **NVIDIA DLSS** | *Not available on native Linux* — the menu shows a note saying so in place of the DLSS switches. The v1.1.0 DLSS / Ray Reconstruction integration (the Windows hook's Vulkan↔GL bridge to NVIDIA's NGX runtime) has no Linux equivalent; everything else in the pack works unchanged. |
 
 ## Performance
 
@@ -283,6 +284,10 @@ include parts of them.
 
 ## Known Issue
 
+- **NVIDIA DLSS / Ray Reconstruction is currently unavailable on native Linux.** The DLSS
+  bridge in the Windows hook (Vulkan↔GL interop + NVIDIA's NGX runtime) is Windows-only, so
+  the menu shows "NVIDIA DLSS: not available on native Linux" instead of the DLSS switches.
+  If that ever changes, this note goes away.
 - **When Sunrise hits for few seconds there is flicker on the opposite side from where the sun is.**
 - **Path Tracing causes some shaky geometry**
 
