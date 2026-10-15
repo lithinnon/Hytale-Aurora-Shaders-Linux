@@ -1,10 +1,8 @@
 > [!IMPORTANT]
-> ## ☕ Please support the original creator:
-> This shader pack is [**Kristijan1001**](https://github.com/Kristijan1001)'s work —
-> this repository only adds the Linux port. If Aurora Shaders makes your game look good,
-> consider tipping the person who made it.
->
-> <a href="https://buymeacoffee.com/kristijan1001"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" width="220" alt="Buy Me a Coffee for Kristijan1001"></a>
+> ## Upstream now supports Linux
+> Aurora Shaders now has native Linux support in the original
+> [repository](https://github.com/Kristijan1001/Hytale-Aurora-Shaders). This repository
+> remains available as an alternative Linux port with its own installer and tooling.
 
 
 https://github.com/user-attachments/assets/9c0842a6-0442-40e9-8760-67f695989e0c
@@ -100,7 +98,7 @@ installed as a Flatpak (`com.hypixel.HytaleLauncher`). No Wine or Proton involve
    the shaders on and off.
 
 - **Hytale installed somewhere else?** `./install-linux.sh --client "<...>/Client"` (the
-  folder containing `HytaleClient`). The choice is remembered for next time.
+   folder containing `HytaleClient`). The choice is remembered for next time.
 - **After a Hytale update:** run `./install-linux.sh` again.
 - **To remove it:** `./install-linux.sh --uninstall`.
 
@@ -137,7 +135,7 @@ the file reloads the shaders).
 | Option | What it does |
 |---|---|
 | **Shaders** | Turns the whole pack on or off (same as the Pause key). |
-| **Preset** | **Standard**, or **RTX**: adds bounce light and ray-traced ambient occlusion (see the RTX section), shadows that get softer the further they fall from what casts them, wet-looking reflective surfaces in rain, and more samples for shadows, light shafts and clouds. Costs noticeably more GPU time. |
+| **Preset** | **Standard**, or **RTX**: adds bounce light and ray-traced ambient occlusion (see the RTX section), shadows that get softer the further they fall from what casts them, wet-looking reflections and more. |
 | **Brightness** | Overall brightness of shaded areas and nights, like Minecraft's brightness slider: low is moody, high is bright. |
 | **Cave lighting %** | The minimum light in places the sun and sky can't reach - caves, deep interiors. Lower makes caves darker. |
 
@@ -232,7 +230,7 @@ These only apply with the **RTX** preset.
 | **Vignette** | Slightly darker screen edges. |
 | **Temporal anti-aliasing** | Smooths edges and cleans up the fine grain in shadows, light shafts and bounce light by combining frames. Turning it off makes those grainy. |
 | **Sharpening** | Sharpens the image (0 is off). |
-| **NVIDIA DLSS** | *Not available on native Linux* — the menu shows a note saying so in place of the DLSS switches. The v1.1.0 DLSS / Ray Reconstruction integration (the Windows hook's Vulkan↔GL bridge to NVIDIA's NGX runtime) has no Linux equivalent; everything else in the pack works unchanged. |
+| **NVIDIA DLSS** | *Not available on native Linux* — the menu shows a note saying so in place of the DLSS switches. The v1.1.0 DLSS / Ray Reconstruction integration (the Windows hook's Vulkan↔GL interop + NVIDIA's NGX runtime) is not available in this Linux port. |
 
 ## Performance
 
@@ -306,5 +304,6 @@ This repository is the Linux fork of
 for the native Linux client — and that Linux port is **purely vibe-coded** (written by AI,
 steered and tested by a human).
 
-Please support the original creator:
-[☕ Buy Kristijan1001 a coffee](https://buymeacoffee.com/kristijan1001).
+The original repository now supports Linux as well; see
+[Aurora Shaders by Kristijan1001](https://github.com/Kristijan1001/Hytale-Aurora-Shaders)
+for the upstream implementation.
